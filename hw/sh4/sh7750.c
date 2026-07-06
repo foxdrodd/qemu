@@ -849,6 +849,17 @@ SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem)
     return s;
 }
 
+/*
+ * Drive port-A input pins from the board (e.g. the Dreamcast video-cable
+ * sense on bits 8-9).  dir_mask selects which bits the board imposes; value
+ * supplies their levels.  Read back through PDTRA when configured as inputs.
+ */
+void sh7750_set_porta(SH7750State *s, uint16_t dir_mask, uint16_t value)
+{
+    s->periph_portdira |= dir_mask;
+    s->periph_pdtra = (s->periph_pdtra & ~dir_mask) | (value & dir_mask);
+}
+
 qemu_irq sh7750_irl(SH7750State *s)
 {
     sh_intc_toggle_source(&s->intc.sources[IRL], 1, 0); /* enable */

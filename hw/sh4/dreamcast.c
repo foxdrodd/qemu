@@ -638,6 +638,14 @@ static void dreamcast_init(MachineState *machine)
     /* Holly System ASIC interrupt controller, driving the SH-4 IRL lines. */
     holly = holly_init(address_space_mem, sh7750_irl(s));
 
+    /*
+     * Report a VGA video cable: port-A bits 8-9 both low select CT_VGA, which
+     * gives pvr2fb a progressive 640x480 VGA mode.  A TV cable would force
+     * interlaced NTSC/PAL with strict broadcast timing that Xfbdev's mode-set
+     * (FBIOPUT_VSCREENINFO) cannot satisfy.
+     */
+    sh7750_set_porta(s, 0x0300, 0x0000);
+
     /* GD-ROM drive on the G1 bus, interrupts routed through Holly.
      * The disc image is supplied via -drive if=none,file=<disc>. */
     dinfo = drive_get(IF_NONE, 0, 0);

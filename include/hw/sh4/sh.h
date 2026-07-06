@@ -43,6 +43,7 @@ struct SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem);
 
 /* sh7750.c */
 qemu_irq sh7750_irl(struct SH7750State *s);
+void sh7750_set_porta(struct SH7750State *s, uint16_t dir_mask, uint16_t value);
 
 /* hw/net/dreamcast_la.c */
 void dc_lanadapter_init(hwaddr base, qemu_irq irq);
