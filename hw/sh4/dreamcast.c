@@ -183,12 +183,16 @@ static HollyState *holly_init(MemoryRegion *sysmem, qemu_irq irl)
 }
 
 /* Holly hardware-event line numbers used by on-board peripherals. */
+#define HOLLY_EV_VSYNC     5    /* ISTNRM bit  5 -> IRQ13 (video vblank) */
+#define HOLLY_EV_MAPLE_DMA 12   /* ISTNRM bit 12 -> IRQ13 */
 #define HOLLY_EV_GDROM_DMA 14   /* ISTNRM bit 14 -> IRQ13 */
 #define HOLLY_EV_GDROM_CMD 32   /* ISTEXT bit  0 -> IRQ11 */
 #define HOLLY_EV_LAN       34   /* ISTEXT bit  2 -> IRQ11 (G2 external) */
 
 /* Sega LAN Adapter (HIT-0300) G2 I/O base. */
 #define LANADAPTER_BASE    0x00600400
+/* Maple bus controller register base. */
+#define MAPLE_BASE         0x005f6c00
 
 static qemu_irq holly_event_irq(HollyState *s, int event)
 {
@@ -645,8 +649,11 @@ static void dreamcast_init(MachineState *machine)
     /* Sega LAN Adapter (HIT-0300) on the G2 bus, IRQ via Holly event 34. */
     dc_lanadapter_init(LANADAPTER_BASE, holly_event_irq(holly, HOLLY_EV_LAN));
 
-    /* PowerVR2 display: scans out the framebuffer from VRAM to a display. */
-    dc_pvr_init(PVR_BASE, vram);
+    /* PowerVR2 display: scans out VRAM and raises VSYNC (Holly event 5). */
+    dc_pvr_init(PVR_BASE, vram, holly_event_irq(holly, HOLLY_EV_VSYNC));
+
+    /* Maple bus (keyboard on port 0), DMA-complete IRQ via Holly event 12. */
+    dc_maple_init(MAPLE_BASE, holly_event_irq(holly, HOLLY_EV_MAPLE_DMA));
 
     /*
      * Load the kernel.  The Dreamcast Linux vmlinux is an SH ELF linked in the

@@ -19,6 +19,8 @@
 #include "hw/sh4/sh.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
+#include "hw/core/irq.h"
 #include "qom/object.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
@@ -40,6 +42,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCPvrState, DC_PVR)
 /* VRAM physical base; pvr2fb programs addresses in the 0xa5000000 view. */
 #define VRAM_PHYS_BASE  0x05000000
 
+#define PVR_VBLANK_HZ   60      /* vertical refresh; paces Maple polling */
+
 struct DCPvrState {
     SysBusDevice parent_obj;
 
@@ -47,6 +51,8 @@ struct DCPvrState {
     MemoryRegion *vram;         /* the machine's VRAM region      */
     MemoryRegionSection fbsection;
     QemuConsole *con;
+    qemu_irq vblank_irq;        /* Holly VSYNC event (drives Maple polling) */
+    QEMUTimer *vblank_timer;
 
     uint32_t regs[PVR_NR_REGS];
 
@@ -249,6 +255,16 @@ static void pvr_reset(DeviceState *dev)
     s->invalidate = true;
 }
 
+/* Periodic vertical-blank: raises the Holly VSYNC event (Maple polls on it). */
+static void pvr_vblank(void *opaque)
+{
+    DCPvrState *s = opaque;
+
+    qemu_set_irq(s->vblank_irq, 1);     /* Holly latches the event (edge) */
+    timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / PVR_VBLANK_HZ);
+}
+
 static void pvr_realize(DeviceState *dev, Error **errp)
 {
     DCPvrState *s = DC_PVR(dev);
@@ -261,8 +277,13 @@ static void pvr_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &pvr_ops, s, "dc-pvr",
                           PVR_REGS_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+    sysbus_init_irq(sbd, &s->vblank_irq);
 
     s->con = qemu_graphic_console_create(dev, 0, &pvr_gfx_ops, s);
+
+    s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pvr_vblank, s);
+    timer_mod(s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NANOSECONDS_PER_SECOND / PVR_VBLANK_HZ);
 }
 
 static const VMStateDescription vmstate_pvr = {
@@ -298,8 +319,8 @@ static void pvr_register_types(void)
 
 type_init(pvr_register_types)
 
-/* Board helper: create the PVR2 display, connect VRAM, map its registers. */
-void dc_pvr_init(hwaddr base, MemoryRegion *vram)
+/* Board helper: create the PVR2 display, connect VRAM, map regs, wire VSYNC. */
+void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
@@ -309,4 +330,5 @@ void dc_pvr_init(hwaddr base, MemoryRegion *vram)
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, base);
+    sysbus_connect_irq(sbd, 0, vblank_irq);
 }

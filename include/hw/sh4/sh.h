@@ -48,6 +48,9 @@ qemu_irq sh7750_irl(struct SH7750State *s);
 void dc_lanadapter_init(hwaddr base, qemu_irq irq);
 
 /* hw/display/dreamcast_pvr.c */
-void dc_pvr_init(hwaddr base, MemoryRegion *vram);
+void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq);
+
+/* hw/input/dreamcast_maple.c */
+void dc_maple_init(hwaddr base, qemu_irq irq);
 
 #endif
