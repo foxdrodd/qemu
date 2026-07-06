@@ -13,3 +13,5 @@
 - Booting Linux with serial console
 - GDROM
 - LAN Adapter Networking
+- X Framebuffer
+- Maple Keyboard, Mouse
