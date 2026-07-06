@@ -316,7 +316,14 @@ static uint64_t sh_serial_read(void *opaque, hwaddr offs,
 
 static int sh_serial_can_receive(SHSerialState *s)
 {
-    return s->scr & (1 << 4) ? SH_RX_FIFO_LENGTH - s->rx_head : 0;
+    /*
+     * Report the real free space in the circular FIFO (capacity minus the
+     * number of unread bytes).  Using the write pointer rx_head here would be
+     * wrong: it wraps to 0 when the FIFO fills, so it would over-report space
+     * and let the chardev overwrite unread bytes -- dropping characters on a
+     * pasted burst.
+     */
+    return s->scr & (1 << 4) ? SH_RX_FIFO_LENGTH - s->rx_cnt : 0;
 }
 
 static void sh_serial_receive_break(SHSerialState *s)
