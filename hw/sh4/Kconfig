@@ -18,6 +18,7 @@ config DREAMCAST
     default y
     depends on SH4
     select SH7750
+    select DC_LANADAPTER
 
 config SH7750
     bool

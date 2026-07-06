@@ -185,6 +185,10 @@ static HollyState *holly_init(MemoryRegion *sysmem, qemu_irq irl)
 /* Holly hardware-event line numbers used by on-board peripherals. */
 #define HOLLY_EV_GDROM_DMA 14   /* ISTNRM bit 14 -> IRQ13 */
 #define HOLLY_EV_GDROM_CMD 32   /* ISTEXT bit  0 -> IRQ11 */
+#define HOLLY_EV_LAN       34   /* ISTEXT bit  2 -> IRQ11 (G2 external) */
+
+/* Sega LAN Adapter (HIT-0300) G2 I/O base. */
+#define LANADAPTER_BASE    0x00600400
 
 static qemu_irq holly_event_irq(HollyState *s, int event)
 {
@@ -637,6 +641,9 @@ static void dreamcast_init(MachineState *machine)
                holly_event_irq(holly, HOLLY_EV_GDROM_CMD),
                holly_event_irq(holly, HOLLY_EV_GDROM_DMA),
                dinfo ? blk_by_legacy_dinfo(dinfo) : NULL);
+
+    /* Sega LAN Adapter (HIT-0300) on the G2 bus, IRQ via Holly event 34. */
+    dc_lanadapter_init(LANADAPTER_BASE, holly_event_irq(holly, HOLLY_EV_LAN));
 
     (void)PVR_BASE;     /* [M2] PowerVR2 framebuffer scanout */
 
