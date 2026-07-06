@@ -48,6 +48,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCMapleState, DC_MAPLE)
 #define RESP_NONE        0xff    /* (int8_t)-1 */
 
 #define FUNC_KEYBOARD    0x40
+#define FUNC_MOUSE       0x200
+
+/* Maple device address byte: bits 6-7 = port, bit 5 = "base unit". */
+#define MAPLE_ADDR(port) (0x20 | ((port) << 6))
+#define KEYBOARD_PORT    0
+#define MOUSE_PORT       1
 
 #define MAPLE_POLL_HZ    60      /* DMA is paced to VBLANK on real hardware */
 
@@ -61,7 +67,8 @@ struct DCMapleState {
     uint32_t dmaaddr;
     uint32_t enable;
 
-    HIDState hid;               /* keyboard on port 0 */
+    HIDState kbd;               /* keyboard on port 0 */
+    HIDState mouse;             /* mouse on port 1    */
 };
 
 /* Big-endian store of a 32-bit maple payload word (function codes etc). */
@@ -73,34 +80,78 @@ static void st_be32(uint8_t *p, uint32_t v)
     p[3] = v;
 }
 
-/* Build the device-information response for the keyboard on port 0. */
-static int maple_build_devinfo(DCMapleState *s, uint8_t *buf)
+/* Build a device-information response for the device on the given port. */
+static int maple_build_devinfo(int port, uint32_t func, const char *name,
+                               uint8_t *buf)
 {
     memset(buf, 0, 116);
     buf[0] = RESP_DEVINFO;
-    buf[1] = 0x20;              /* sender: port 0, base unit  */
+    buf[1] = MAPLE_ADDR(port);  /* sender: port, base unit    */
     buf[2] = 0x00;              /* recipient: host            */
     buf[3] = 28;               /* payload length in words    */
-    st_be32(&buf[4], FUNC_KEYBOARD);
+    st_be32(&buf[4], func);
     buf[20] = 0xff;            /* area code                  */
     buf[21] = 0x00;            /* connector direction        */
-    memcpy(&buf[22], "Keyboard                      ", 30);
+    memset(&buf[22], ' ', 30);
+    memcpy(&buf[22], name, strlen(name));
     memcpy(&buf[52],
            "Produced By or Under License From SEGA ENTERPRISES,LTD.     ", 60);
     return 116;
 }
 
 /* Build the keyboard "get condition" response (8-byte HID report). */
-static int maple_build_getcond(DCMapleState *s, uint8_t *buf)
+static int maple_build_kbd_getcond(DCMapleState *s, uint8_t *buf)
 {
     memset(buf, 0, 16);
     buf[0] = RESP_DATATRF;
-    buf[1] = 0x20;
+    buf[1] = MAPLE_ADDR(KEYBOARD_PORT);
     buf[2] = 0x00;
     buf[3] = 3;                /* function word + two data words */
     st_be32(&buf[4], FUNC_KEYBOARD);
-    hid_keyboard_poll(&s->hid, &buf[8], 8);
+    hid_keyboard_poll(&s->kbd, &buf[8], 8);
     return 16;
+}
+
+/*
+ * Build the mouse "get condition" response.  Linux drivers/input/mouse/
+ * maplemouse.c reads: buttons = ~res[8] (active-low; bit2 left, bit1 right,
+ * bit3 middle) and three little-endian 16-bit axes at res+12/14/16, each
+ * biased by 512 (512 == no movement).  QEMU's HID mouse report gives us
+ * relative dx/dy/dz in [-127,127], which fits directly into that bias.
+ */
+static int maple_build_mouse_getcond(DCMapleState *s, uint8_t *buf)
+{
+    uint8_t rep[4];
+    int dx, dy, dz;
+    uint8_t dcbtn = 0;
+
+    hid_pointer_poll(&s->mouse, rep, sizeof(rep));
+    /* rep[0] = buttons (bit0 left, bit1 right, bit2 middle) */
+    if (rep[0] & 0x01) {
+        dcbtn |= 0x04;         /* left  */
+    }
+    if (rep[0] & 0x02) {
+        dcbtn |= 0x02;         /* right */
+    }
+    if (rep[0] & 0x04) {
+        dcbtn |= 0x08;         /* middle */
+    }
+    dx = 512 + (int8_t)rep[1];
+    dy = 512 + (int8_t)rep[2];
+    dz = 512 + (int8_t)rep[3];
+
+    memset(buf, 0, 20);
+    buf[0] = RESP_DATATRF;
+    buf[1] = MAPLE_ADDR(MOUSE_PORT);
+    buf[2] = 0x00;
+    buf[3] = 4;                /* function word + three data words */
+    st_be32(&buf[4], FUNC_MOUSE);
+    buf[8] = ~dcbtn;           /* buttons, active-low        */
+    buf[9] = 0xff;             /* button high byte (released) */
+    buf[12] = dx & 0xff;  buf[13] = (dx >> 8) & 0xff;
+    buf[14] = dy & 0xff;  buf[15] = (dy >> 8) & 0xff;
+    buf[16] = dz & 0xff;  buf[17] = (dz >> 8) & 0xff;
+    return 20;
 }
 
 /* Process one queued transfer list: walk blocks, write responses. */
@@ -125,19 +176,39 @@ static void maple_process_dma(DCMapleState *s)
         cmd = w2 & 0xff;
         to = (w2 >> 8) & 0xff;      /* recipient device address */
 
-        /* Only a keyboard on port 0, base unit (address bit 0x20). */
-        if (port == 0 && (to & 0x20)) {
-            switch (cmd) {
-            case CMD_DEVINFO:
-                n = maple_build_devinfo(s, resp);
-                break;
-            case CMD_GETCOND:
-                n = maple_build_getcond(s, resp);
-                break;
-            default:
+        /* Keyboard on port 0, mouse on port 1; both base units (bit 0x20). */
+        if (to & 0x20) {
+            if (port == KEYBOARD_PORT) {
+                switch (cmd) {
+                case CMD_DEVINFO:
+                    n = maple_build_devinfo(KEYBOARD_PORT, FUNC_KEYBOARD,
+                                            "Keyboard", resp);
+                    break;
+                case CMD_GETCOND:
+                    n = maple_build_kbd_getcond(s, resp);
+                    break;
+                default:
+                    resp[0] = RESP_NONE;
+                    n = 4;
+                    break;
+                }
+            } else if (port == MOUSE_PORT) {
+                switch (cmd) {
+                case CMD_DEVINFO:
+                    n = maple_build_devinfo(MOUSE_PORT, FUNC_MOUSE,
+                                            "Mouse", resp);
+                    break;
+                case CMD_GETCOND:
+                    n = maple_build_mouse_getcond(s, resp);
+                    break;
+                default:
+                    resp[0] = RESP_NONE;
+                    n = 4;
+                    break;
+                }
+            } else {
                 resp[0] = RESP_NONE;
                 n = 4;
-                break;
             }
         } else {
             resp[0] = RESP_NONE;    /* nothing on this port/unit */
@@ -213,7 +284,7 @@ static const MemoryRegionOps maple_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static void maple_keyboard_event(HIDState *hid)
+static void maple_input_event(HIDState *hid)
 {
     /* State is pulled on the next GETCOND poll; nothing to do here. */
 }
@@ -224,7 +295,8 @@ static void maple_reset(DeviceState *dev)
 
     s->dmaaddr = 0;
     s->enable = 0;
-    hid_reset(&s->hid);
+    hid_reset(&s->kbd);
+    hid_reset(&s->mouse);
 }
 
 static void maple_realize(DeviceState *dev, Error **errp)
@@ -237,7 +309,8 @@ static void maple_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
 
-    hid_init(&s->hid, HID_KEYBOARD, maple_keyboard_event);
+    hid_init(&s->kbd, HID_KEYBOARD, maple_input_event);
+    hid_init(&s->mouse, HID_MOUSE, maple_input_event);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maple_timer, s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -251,7 +324,8 @@ static const VMStateDescription vmstate_maple = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dmaaddr, DCMapleState),
         VMSTATE_UINT32(enable, DCMapleState),
-        VMSTATE_HID_KEYBOARD_DEVICE(hid, DCMapleState),
+        VMSTATE_HID_KEYBOARD_DEVICE(kbd, DCMapleState),
+        VMSTATE_HID_POINTER_DEVICE(mouse, DCMapleState),
         VMSTATE_END_OF_LIST()
     }
 };
