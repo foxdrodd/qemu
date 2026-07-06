@@ -55,7 +55,7 @@
 
 #define HOLLY_INTC_BASE 0x005f6900       /* Holly ASIC interrupt regs (ESR/EMR) */
 #define HOLLY_INTC_SIZE 0x40
-#define PVR_BASE        0x005f8000       /* PowerVR2 / TA registers     [M2] */
+#define PVR_BASE        0x005f8000       /* PowerVR2 display registers */
 
 /* CONFIG_BOOT_LINK_OFFSET of the Dreamcast Linux kernel. */
 #define LINUX_LOAD_OFFSET  0x00800000
@@ -645,7 +645,8 @@ static void dreamcast_init(MachineState *machine)
     /* Sega LAN Adapter (HIT-0300) on the G2 bus, IRQ via Holly event 34. */
     dc_lanadapter_init(LANADAPTER_BASE, holly_event_irq(holly, HOLLY_EV_LAN));
 
-    (void)PVR_BASE;     /* [M2] PowerVR2 framebuffer scanout */
+    /* PowerVR2 display: scans out the framebuffer from VRAM to a display. */
+    dc_pvr_init(PVR_BASE, vram);
 
     /*
      * Load the kernel.  The Dreamcast Linux vmlinux is an SH ELF linked in the

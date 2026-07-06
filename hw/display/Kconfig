@@ -73,6 +73,10 @@ config BOCHS_DISPLAY
 config FRAMEBUFFER
     bool
 
+config DC_PVR
+    bool
+    select FRAMEBUFFER
+
 config SM501
     bool
     select I2C
