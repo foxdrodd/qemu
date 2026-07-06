@@ -671,8 +671,14 @@ static void dreamcast_init(MachineState *machine)
     /* PowerVR2 display: scans out VRAM and raises VSYNC (Holly event 5). */
     dc_pvr_init(PVR_BASE, vram, holly_event_irq(holly, HOLLY_EV_VSYNC));
 
-    /* Maple bus (keyboard on port 0), DMA-complete IRQ via Holly event 12. */
-    dc_maple_init(MAPLE_BASE, holly_event_irq(holly, HOLLY_EV_MAPLE_DMA));
+    /*
+     * Maple bus: keyboard (port 0), mouse (port 1), DMA-complete IRQ via Holly
+     * event 12.  A second "-drive if=none" (unit 1, a 128 KB image) attaches a
+     * VMU in a controller's slot on port 2.
+     */
+    dinfo = drive_get(IF_NONE, 0, 1);
+    dc_maple_init(MAPLE_BASE, holly_event_irq(holly, HOLLY_EV_MAPLE_DMA),
+                  dinfo ? dc_vmu_new(blk_by_legacy_dinfo(dinfo)) : NULL);
 
     /*
      * Load the kernel.  The Dreamcast Linux vmlinux is an SH ELF linked in the

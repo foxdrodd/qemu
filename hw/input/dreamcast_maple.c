@@ -47,13 +47,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCMapleState, DC_MAPLE)
 #define RESP_DATATRF     8
 #define RESP_NONE        0xff    /* (int8_t)-1 */
 
+#define RESP_OK          7
+
 #define FUNC_KEYBOARD    0x40
 #define FUNC_MOUSE       0x200
+#define FUNC_CONTROLLER  0x01
 
-/* Maple device address byte: bits 6-7 = port, bit 5 = "base unit". */
-#define MAPLE_ADDR(port) (0x20 | ((port) << 6))
+/*
+ * Maple device address byte: bits 6-7 = port, bit 5 = base unit, bits 0-4 =
+ * expansion sub-unit (bit 0 = slot 1).  A VMU always lives in a controller's
+ * slot, so it appears as sub-unit 1 of the controller on CONTROLLER_PORT.
+ */
+#define MAPLE_ADDR(port)     (0x20 | ((port) << 6))
+#define MAPLE_SUBADDR(port)  (((port) << 6) | 0x01)   /* sub-unit 1 */
+#define MAPLE_HOSTADDR(port) ((port) << 6)
 #define KEYBOARD_PORT    0
 #define MOUSE_PORT       1
+#define CONTROLLER_PORT  2
+#define VMU_SUBMASK      0x01       /* controller reports a device in slot 1 */
 
 #define MAPLE_POLL_HZ    60      /* DMA is paced to VBLANK on real hardware */
 
@@ -69,6 +80,7 @@ struct DCMapleState {
 
     HIDState kbd;               /* keyboard on port 0 */
     HIDState mouse;             /* mouse on port 1    */
+    DCVmu *vmu;                 /* VMU in the controller slot on port 2 */
 };
 
 /* Big-endian store of a 32-bit maple payload word (function codes etc). */
@@ -154,12 +166,52 @@ static int maple_build_mouse_getcond(DCMapleState *s, uint8_t *buf)
     return 20;
 }
 
+/*
+ * Controller base unit on CONTROLLER_PORT.  It exists to host the VMU: the
+ * sub-device mask in response byte 2 tells Linux a device sits in slot 1, so
+ * the bus then scans sub-unit 1 (the VMU).
+ */
+static int maple_build_controller_devinfo(uint8_t *buf)
+{
+    memset(buf, 0, 116);
+    buf[0] = RESP_DEVINFO;
+    buf[1] = MAPLE_HOSTADDR(CONTROLLER_PORT);
+    buf[2] = 0x20 | VMU_SUBMASK;   /* base unit + slot 1 occupied */
+    buf[3] = 28;
+    st_be32(&buf[4], FUNC_CONTROLLER);
+    buf[20] = 0xff;
+    buf[21] = 0x00;
+    memset(&buf[22], ' ', 30);
+    memcpy(&buf[22], "Dreamcast Controller", 20);
+    memcpy(&buf[52],
+           "Produced By or Under License From SEGA ENTERPRISES,LTD.     ", 60);
+    return 116;
+}
+
+/* Controller "get condition": neutral (nothing pressed, sticks centered). */
+static int maple_build_controller_getcond(uint8_t *buf)
+{
+    memset(buf, 0, 16);
+    buf[0] = RESP_DATATRF;
+    buf[1] = MAPLE_HOSTADDR(CONTROLLER_PORT);
+    buf[2] = MAPLE_ADDR(CONTROLLER_PORT);
+    buf[3] = 3;
+    st_be32(&buf[4], FUNC_CONTROLLER);
+    buf[8] = 0xff;                 /* buttons are active-low: none pressed */
+    buf[9] = 0xff;
+    buf[12] = 0x80;               /* analog sticks centered */
+    buf[13] = 0x80;
+    buf[14] = 0x80;
+    buf[15] = 0x80;
+    return 16;
+}
+
 /* Process one queued transfer list: walk blocks, write responses. */
 static void maple_process_dma(DCMapleState *s)
 {
     AddressSpace *as = &address_space_memory;
     hwaddr ptr = s->dmaaddr;
-    uint8_t resp[128];
+    uint8_t resp[1032];            /* a VMU block-read response is ~524 bytes */
     int guard = 0;
 
     while (guard++ < 64) {
@@ -176,8 +228,8 @@ static void maple_process_dma(DCMapleState *s)
         cmd = w2 & 0xff;
         to = (w2 >> 8) & 0xff;      /* recipient device address */
 
-        /* Keyboard on port 0, mouse on port 1; both base units (bit 0x20). */
         if (to & 0x20) {
+            /* Base unit: keyboard (0), mouse (1), controller (2). */
             if (port == KEYBOARD_PORT) {
                 switch (cmd) {
                 case CMD_DEVINFO:
@@ -206,7 +258,39 @@ static void maple_process_dma(DCMapleState *s)
                     n = 4;
                     break;
                 }
+            } else if (port == CONTROLLER_PORT && s->vmu) {
+                switch (cmd) {
+                case CMD_DEVINFO:
+                    n = maple_build_controller_devinfo(resp);
+                    break;
+                case CMD_GETCOND:
+                    n = maple_build_controller_getcond(resp);
+                    break;
+                default:
+                    resp[0] = RESP_NONE;
+                    n = 4;
+                    break;
+                }
             } else {
+                resp[0] = RESP_NONE;
+                n = 4;
+            }
+        } else if (port == CONTROLLER_PORT && (to & VMU_SUBMASK) && s->vmu) {
+            /* VMU in the controller's expansion slot (sub-unit 1). */
+            uint8_t cmddata[256];
+            int datalen = len * 4;
+
+            if (datalen > (int)sizeof(cmddata)) {
+                datalen = sizeof(cmddata);
+            }
+            if (datalen > 0) {
+                dma_memory_read(as, ptr + 12, cmddata, datalen,
+                                MEMTXATTRS_UNSPECIFIED);
+            }
+            n = dc_vmu_maple(s->vmu, cmd, MAPLE_HOSTADDR(CONTROLLER_PORT),
+                             MAPLE_SUBADDR(CONTROLLER_PORT),
+                             cmddata, datalen, resp);
+            if (n <= 0) {
                 resp[0] = RESP_NONE;
                 n = 4;
             }
@@ -353,13 +437,15 @@ static void maple_register_types(void)
 
 type_init(maple_register_types)
 
-/* Board helper: create the Maple controller, map it, wire its interrupt. */
-void dc_maple_init(hwaddr base, qemu_irq irq)
+/* Board helper: create the Maple controller, map it, wire its interrupt.
+ * If vmu is non-NULL, a controller with that VMU in slot 1 appears on port 2. */
+void dc_maple_init(hwaddr base, qemu_irq irq, DCVmu *vmu)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
 
     dev = qdev_new(TYPE_DC_MAPLE);
+    DC_MAPLE(dev)->vmu = vmu;
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, base);

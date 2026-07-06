@@ -54,7 +54,13 @@ void dc_gaps_init(qemu_irq irq);
 /* hw/display/dreamcast_pvr.c */
 void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq);
 
+/* hw/block/dreamcast_vmu.c */
+typedef struct DCVmu DCVmu;
+DCVmu *dc_vmu_new(BlockBackend *blk);
+int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
+                 const uint8_t *data, int datalen, uint8_t *resp);
+
 /* hw/input/dreamcast_maple.c */
-void dc_maple_init(hwaddr base, qemu_irq irq);
+void dc_maple_init(hwaddr base, qemu_irq irq, DCVmu *vmu);
 
 #endif

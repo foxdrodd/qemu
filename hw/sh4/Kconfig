@@ -21,6 +21,7 @@ config DREAMCAST
     select DC_LANADAPTER
     select DC_PVR
     select DC_MAPLE
+    select DC_VMU
     select DREAMCAST_GAPS
 
 config SH7750

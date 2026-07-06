@@ -1,6 +1,9 @@
 config FDC
     bool
 
+config DC_VMU
+    bool
+
 config FDC_ISA
     bool
     depends on ISA_BUS

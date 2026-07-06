@@ -131,6 +131,34 @@ rtl8139), `DREAMCAST` selects it, `dc_gaps_init()` in `dreamcast.c`. NIC choice
 LAN-vs-BBA via a machine property or `-nic model=`. Reference host bridges:
 `hw/pci-host/{dino,grackle}.c`.
 
+## VMU (Visual Memory Unit) — DONE
+
+`hw/block/dreamcast_vmu.c` (`DCVmu`, backed by a `BlockBackend`) + controller/
+sub-unit dispatch in `hw/input/dreamcast_maple.c`. The VMU is a **Maple sub-unit
+of a controller** (it plugs into a controller slot): a controller base unit
+appears on port 2, advertising a device in slot 1, and the VMU answers at
+`(port 2, unit 1)`. Guest sees a 128 KB MTD (`vmu-flash` → `fs/vmufat`).
+Attach with a **second `-drive if=none`** (unit 1, exactly 128 KB); the first is
+the GD-ROM. Verified: detected as controller (2,0) + `Visual Memory` (2,1),
+`mtd0` 128 KB, BREAD/BWRITE/BSYNC, writes persist to the host image.
+
+Gotchas:
+- **Sub-unit addressing**: `to = (port<<6) | (unit>0 ? 1<<(unit-1) : 0x20)`, so
+  VMU slot 1 = address bit `0x01`. The controller advertises it via the
+  **sub-device mask in DEVINFO response byte 2** (`recvbuf[2] & 0x1F`).
+- A **controller must host it** — `CONFIG_JOYSTICK_MAPLE=y`, so the base unit
+  must also answer GETCOND with a neutral condition or the port (and its VMU)
+  gets detached.
+- **GETMINFO is little-endian 16-bit shorts** over the whole frame: `res[6]`
+  (byte 12) = root block, `res[12]` (byte 24) = user blocks; `numblocks=root+1`.
+- BREAD/BWRITE data words are **big-endian** (function, then addr =
+  `partition<<24 | phase<<16 | block`); block payload is raw bytes. Read data
+  goes at **response byte 12**; a block-read response is ~524 B (bump the maple
+  `resp[]` buffer). Writes are 4×128-B phases → each phase written directly to
+  its slice; BSYNC flushes.
+- Must `blk_set_perm(blk, CONSISTENT_READ|WRITE, ALL)` on the backend or QEMU
+  asserts on the first write.
+
 ## Status
 
 Working & verified: machine boot, Holly IRQs, serial console, GD-ROM rootfs mount
@@ -138,4 +166,6 @@ Working & verified: machine boot, Holly IRQs, serial console, GD-ROM rootfs moun
 Maple keyboard, VGA-cable X (no duplication), Maple **mouse** (kernel detects
 `function 0x200` on port 1 as `input1`/`mouse0`; QMP motion reaches the device),
 **Broadband Adapter** (RTL8139 via GAPS PCI bridge, the default NIC: DHCP +
-ping 0% loss, mainline `8139too`). Not done: AICA sound; PVR 3D/TA (not needed).
+ping 0% loss, mainline `8139too`), **VMU** (controller sub-unit, 128 KB MTD via
+mainline `vmu-flash`, second `-drive if=none`). Not done: AICA sound; PVR 3D/TA
+(not needed); VMU LCD/RTC sub-functions.
