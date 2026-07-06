@@ -40,6 +40,7 @@
 #include "system/block-backend.h"
 #include "system/blockdev.h"
 #include "system/dma.h"
+#include "net/net.h"
 
 /*
  * Dreamcast physical memory map (SH-4 Area layout).
@@ -188,6 +189,7 @@ static HollyState *holly_init(MemoryRegion *sysmem, qemu_irq irl)
 #define HOLLY_EV_GDROM_DMA 14   /* ISTNRM bit 14 -> IRQ13 */
 #define HOLLY_EV_GDROM_CMD 32   /* ISTEXT bit  0 -> IRQ11 */
 #define HOLLY_EV_LAN       34   /* ISTEXT bit  2 -> IRQ11 (G2 external) */
+#define HOLLY_EV_EXTERNAL  35   /* ISTEXT bit  3 -> IRQ11 (BBA / GAPS PCI) */
 
 /* Sega LAN Adapter (HIT-0300) G2 I/O base. */
 #define LANADAPTER_BASE    0x00600400
@@ -654,8 +656,17 @@ static void dreamcast_init(MachineState *machine)
                holly_event_irq(holly, HOLLY_EV_GDROM_DMA),
                dinfo ? blk_by_legacy_dinfo(dinfo) : NULL);
 
-    /* Sega LAN Adapter (HIT-0300) on the G2 bus, IRQ via Holly event 34. */
-    dc_lanadapter_init(LANADAPTER_BASE, holly_event_irq(holly, HOLLY_EV_LAN));
+    /*
+     * G2 networking.  The Broadband Adapter (RTL8139 behind the GAPS PCI
+     * bridge, IRQ via Holly event 35) is the default; "-nic ...,model=
+     * dc-lanadapter" selects the older Sega LAN Adapter instead.
+     */
+    if (qemu_find_nic_info("dc-lanadapter", false, NULL)) {
+        dc_lanadapter_init(LANADAPTER_BASE,
+                           holly_event_irq(holly, HOLLY_EV_LAN));
+    } else {
+        dc_gaps_init(holly_event_irq(holly, HOLLY_EV_EXTERNAL));
+    }
 
     /* PowerVR2 display: scans out VRAM and raises VSYNC (Holly event 5). */
     dc_pvr_init(PVR_BASE, vram, holly_event_irq(holly, HOLLY_EV_VSYNC));

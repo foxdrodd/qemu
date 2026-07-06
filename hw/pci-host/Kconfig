@@ -86,6 +86,11 @@ config SH_PCI
     bool
     select PCI
 
+config DREAMCAST_GAPS
+    bool
+    select PCI
+    select RTL8139_PCI
+
 config ARTICIA
     bool
     select PCI

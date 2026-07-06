@@ -8,6 +8,19 @@
   -drive if=none,file=/home/flo/devel/t2-hacking/dreamcast/dreamcast-linux/build/linux-7.1.3-with-userland-musl.iso,format=raw,readonly=on
 ```
 
+# NIC Support
+
+## LAN Adapter
+
+```
+-nic model=dc-lanadapter
+```
+
+## BBA rtl8139too
+
+is the default selection.
+
+
 # Supports
 
 - Booting Linux with serial console

@@ -48,6 +48,9 @@ void sh7750_set_porta(struct SH7750State *s, uint16_t dir_mask, uint16_t value);
 /* hw/net/dreamcast_la.c */
 void dc_lanadapter_init(hwaddr base, qemu_irq irq);
 
+/* hw/pci-host/dreamcast_gaps.c */
+void dc_gaps_init(qemu_irq irq);
+
 /* hw/display/dreamcast_pvr.c */
 void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq);
 
