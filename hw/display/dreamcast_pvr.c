@@ -37,7 +37,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCPvrState, DC_PVR)
 #define DISP_DIWADDRL   0x50    /* framebuffer start (long field / even)   */
 #define DISP_DIWADDRS   0x54    /* framebuffer start (short field / odd)   */
 #define DISP_DIWSIZE    0x5c    /* modulo<<20 | (rows-1)<<10 | (words-1)   */
-#define DISP_PIXDEPTH   0x108   /* bytes-per-pixel << 2                    */
+
+/*
+ * The bytes-per-pixel lives in DIWMODE bits 2-3 (value = bpp-1), written by
+ * pvr2_init_display().  Register 0x108 is NOT a reliable pixel-depth source:
+ * pvr2fb overloads it - pvr2fb_set_pal_type() writes the palette type there,
+ * clobbering the depth value the moment X (or fbcon in palette mode) sets up
+ * its colour map.  Always take the depth from DIWMODE.
+ */
+static inline uint32_t pvr_bytespp(uint32_t diwmode)
+{
+    return ((diwmode >> 2) & 3) + 1;
+}
 
 /* VRAM physical base; pvr2fb programs addresses in the 0xa5000000 view. */
 #define VRAM_PHYS_BASE  0x05000000
@@ -69,8 +80,7 @@ static void pvr_draw_line(void *opaque, uint8_t *dst, const uint8_t *src,
     DCPvrState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
     int bpp = surface_bits_per_pixel(surface);
-    /* PIXDEPTH holds (bytes-per-pixel - 1) << 2 (see pvr2fb.c). */
-    uint32_t bytespp = (s->regs[DISP_PIXDEPTH / 4] >> 2) + 1;
+    uint32_t bytespp = pvr_bytespp(s->regs[DISP_DIWMODE / 4]);
     uint8_t r, g, b;
 
     while (width--) {
@@ -123,8 +133,7 @@ static bool pvr_get_mode(DCPvrState *s, uint32_t *width, uint32_t *height,
 {
     uint32_t diwmode = s->regs[DISP_DIWMODE / 4];
     uint32_t diwsize = s->regs[DISP_DIWSIZE / 4];
-    /* PIXDEPTH holds (bytes-per-pixel - 1) << 2 (see pvr2fb.c). */
-    uint32_t bytespp = (s->regs[DISP_PIXDEPTH / 4] >> 2) + 1;
+    uint32_t bytespp = pvr_bytespp(diwmode);
     uint32_t words, rows, modulo, line_bytes;
     uint32_t addr;
 
@@ -228,7 +237,6 @@ static void pvr_write(void *opaque, hwaddr addr, uint64_t val,
         case DISP_DIWMODE:
         case DISP_DIWADDRL:
         case DISP_DIWSIZE:
-        case DISP_PIXDEPTH:
             s->invalidate = true;
             break;
         }
