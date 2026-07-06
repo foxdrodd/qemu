@@ -56,7 +56,7 @@ void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq);
 
 /* hw/block/dreamcast_vmu.c */
 typedef struct DCVmu DCVmu;
-DCVmu *dc_vmu_new(BlockBackend *blk);
+DCVmu *dc_vmu_new(BlockBackend *blk, bool lcd);
 int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
                  const uint8_t *data, int datalen, uint8_t *resp);
 

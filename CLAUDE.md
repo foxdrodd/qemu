@@ -159,6 +159,29 @@ Gotchas:
 - Must `blk_set_perm(blk, CONSISTENT_READ|WRITE, ALL)` on the backend or QEMU
   asserts on the first write.
 
+### VMU LCD (opt-in second display) — DONE
+
+The VMU's 48×32 1bpp LCD is a **second QEMU graphic console** owned by the
+`DCVmu` device, opt-in via the `vmu-lcd=on` machine option (a bool on the
+`DreamcastMachineState` subclass, wired through `DEFINE_MACHINE_EXTENDED`).
+When enabled, DEVINFO advertises `function = FUNC_MEMCARD|FUNC_LCD` (`0x06`) and
+the extra LCD function block, so mainline-style `vmu-flash` calls
+`vmu_lcd_register()` → `/dev/vmu_lcd0`. The kernel draws a Tux splash on attach.
+Verified end-to-end: `function 0x6` detected, `vmu_lcd0` registered, and a
+`screendump -d vmu` of the second console shows the 288×192 (48·6 × 32·6) green
+Tux+"Linux" splash.
+
+Gotchas:
+- LCD updates arrive as **BWRITE tagged with `FUNC_LCD` (`0x04`)** in the
+  function word — dispatch on that in `dc_vmu_maple` before the storage path; the
+  192-byte framebuffer is at `data[8..]`, MSB-first, top-left origin.
+- `GraphicHwOps.gfx_update` must return **`bool`**, not void.
+- The console is targetable by `screendump -d vmu` because `dc_vmu_new` sets
+  `dev->id = "vmu"` (QMP screendump resolves `device` via `qdev_find_recursive`,
+  i.e. by **id**, not QOM path). `query-consoles` does not exist in this build.
+- The kernel draws the splash from a **workqueue** (never from maple probe
+  context), so it appears a beat after `vmu_lcd0` registers.
+
 ## Status
 
 Working & verified: machine boot, Holly IRQs, serial console, GD-ROM rootfs mount
@@ -167,5 +190,6 @@ Maple keyboard, VGA-cable X (no duplication), Maple **mouse** (kernel detects
 `function 0x200` on port 1 as `input1`/`mouse0`; QMP motion reaches the device),
 **Broadband Adapter** (RTL8139 via GAPS PCI bridge, the default NIC: DHCP +
 ping 0% loss, mainline `8139too`), **VMU** (controller sub-unit, 128 KB MTD via
-mainline `vmu-flash`, second `-drive if=none`). Not done: AICA sound; PVR 3D/TA
-(not needed); VMU LCD/RTC sub-functions.
+mainline `vmu-flash`, second `-drive if=none`), **VMU LCD** (opt-in `vmu-lcd=on`
+second console: `function 0x6`, `vmu_lcd0`, Tux splash renders). Not done: AICA
+sound; PVR 3D/TA (not needed); VMU RTC sub-function.

@@ -1,16 +1,19 @@
 /*
- * Sega Dreamcast Visual Memory Unit (VMU) - storage function
+ * Sega Dreamcast Visual Memory Unit (VMU) - storage + LCD
  *
  * A VMU is a Maple bus peripheral that plugs into a controller's expansion
- * slot.  Its 128 KB flash is exposed by Linux's drivers/mtd/maps/vmu-flash.c
- * as a 256-block x 512-byte MTD (function MAPLE_FUNC_MEMCARD), on top of which
- * fs/vmufat mounts.  This models just the storage function, backed by a
- * QEMU BlockBackend (a 128 KB host image).
+ * slot.  It is a multi-function device: 128 KB flash (MAPLE_FUNC_MEMCARD) and,
+ * optionally, a 48x32 monochrome LCD (MAPLE_FUNC_LCD).  Linux drives the flash
+ * with drivers/mtd/maps/vmu-flash.c (a 256-block x 512-byte MTD) and the LCD
+ * with drivers/auxdisplay/vmu-lcd.c (a /dev/vmu_lcd char device).
  *
- * The Maple storage command set (DEVINFO / GETMINFO / BREAD / BWRITE / BSYNC)
- * follows include/linux/maple.h and drivers/mtd/maps/vmu-flash.c.  The Maple
- * bus controller (hw/input/dreamcast_maple.c) forwards frames addressed to the
- * VMU's sub-unit here via dc_vmu_maple().
+ * The flash is backed by a QEMU BlockBackend (128 KB host image).  When the
+ * LCD is enabled it is presented as a second QEMU graphic console (a separate
+ * window / display head); the guest pushes 192-byte framebuffers to it via a
+ * Maple BWRITE tagged with MAPLE_FUNC_LCD.
+ *
+ * The Maple bus controller (hw/input/dreamcast_maple.c) forwards frames
+ * addressed to the VMU's sub-unit here via dc_vmu_maple().
  *
  * Copyright (c) 2026 Florian Fuchs
  *
@@ -20,8 +23,17 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "hw/core/sysbus.h"
 #include "hw/sh4/sh.h"
 #include "system/block-backend.h"
+#include "migration/vmstate.h"
+#include "qemu/module.h"
+#include "qom/object.h"
+#include "ui/console.h"
+#include "ui/pixel_ops.h"
+
+#define TYPE_DC_VMU "dc-vmu"
+DECLARE_INSTANCE_CHECKER(DCVmu, DC_VMU, TYPE_DC_VMU)
 
 #define VMU_BLOCK_SIZE   512
 #define VMU_NUM_BLOCKS   256
@@ -34,8 +46,15 @@
 #define VMU_DIR_COUNT    13
 #define VMU_USER_BLOCKS  200
 
-/* Maple function code and command / response codes. */
+/* LCD: 48x32, 1 bit per pixel, MSB first, 192 bytes; scaled up for display. */
+#define LCD_WIDTH        48
+#define LCD_HEIGHT       32
+#define LCD_FB_SIZE      (LCD_WIDTH * LCD_HEIGHT / 8)
+#define LCD_MAGNIFY      6
+
+/* Maple function codes and command / response codes. */
 #define FUNC_MEMCARD     0x02
+#define FUNC_LCD         0x04
 #define CMD_DEVINFO      1
 #define CMD_GETMINFO     10
 #define CMD_BREAD        11
@@ -47,7 +66,15 @@
 #define RESP_NONE        0xff
 
 struct DCVmu {
+    SysBusDevice parent_obj;
+
     BlockBackend *blk;
+    bool lcd_enabled;
+
+    /* LCD state (only used when lcd_enabled). */
+    QemuConsole *con;
+    uint8_t lcd_fb[LCD_FB_SIZE];
+    bool redraw;
 };
 
 static void st_be32(uint8_t *p, uint32_t v)
@@ -60,21 +87,126 @@ static void st_le16(uint8_t *p, uint16_t v)
     p[0] = v; p[1] = v >> 8;
 }
 
-/* DEVINFO: report the memory-card function and its geometry word. */
-static int vmu_devinfo(uint8_t host, uint8_t dev, uint8_t *buf)
+/* ---- LCD display console ---------------------------------------------- */
+
+static bool vmu_lcd_gfx_update(void *opaque)
 {
+    DCVmu *v = opaque;
+    DisplaySurface *surface = qemu_console_surface(v->con);
+    int bpp = surface_bits_per_pixel(surface);
+    int bypp = (bpp + 7) >> 3;
+    int stride = surface_stride(surface);
+    uint8_t *base = surface_data(surface);
+    uint32_t on, off;
+    int x, y, dx, dy;
+
+    if (!v->redraw) {
+        return true;
+    }
+
+    /* Dark pixels on the VMU's pale green-grey background. */
+    switch (bpp) {
+    case 8:
+        on = rgb_to_pixel8(0x18, 0x20, 0x18);
+        off = rgb_to_pixel8(0x8c, 0xc0, 0x9c);
+        break;
+    case 15:
+        on = rgb_to_pixel15(0x18, 0x20, 0x18);
+        off = rgb_to_pixel15(0x8c, 0xc0, 0x9c);
+        break;
+    case 16:
+        on = rgb_to_pixel16(0x18, 0x20, 0x18);
+        off = rgb_to_pixel16(0x8c, 0xc0, 0x9c);
+        break;
+    case 24:
+        on = rgb_to_pixel24(0x18, 0x20, 0x18);
+        off = rgb_to_pixel24(0x8c, 0xc0, 0x9c);
+        break;
+    case 32:
+        on = rgb_to_pixel32(0x18, 0x20, 0x18);
+        off = rgb_to_pixel32(0x8c, 0xc0, 0x9c);
+        break;
+    default:
+        return true;
+    }
+
+    for (y = 0; y < LCD_HEIGHT; y++) {
+        for (x = 0; x < LCD_WIDTH; x++) {
+            int bit = (v->lcd_fb[y * (LCD_WIDTH / 8) + (x >> 3)]
+                       >> (7 - (x & 7))) & 1;
+            uint32_t c = bit ? on : off;
+
+            for (dy = 0; dy < LCD_MAGNIFY; dy++) {
+                uint8_t *p = base + (y * LCD_MAGNIFY + dy) * stride +
+                             (x * LCD_MAGNIFY) * bypp;
+                for (dx = 0; dx < LCD_MAGNIFY; dx++) {
+                    memcpy(p, &c, bypp);
+                    p += bypp;
+                }
+            }
+        }
+    }
+
+    v->redraw = false;
+    qemu_console_update(v->con, 0, 0, LCD_WIDTH * LCD_MAGNIFY,
+                        LCD_HEIGHT * LCD_MAGNIFY);
+    return true;
+}
+
+static void vmu_lcd_invalidate(void *opaque)
+{
+    DCVmu *v = opaque;
+    v->redraw = true;
+}
+
+static const GraphicHwOps vmu_lcd_ops = {
+    .invalidate = vmu_lcd_invalidate,
+    .gfx_update = vmu_lcd_gfx_update,
+};
+
+/* LCD BWRITE: [func][addr][192-byte framebuffer].  Repaint on the next frame. */
+static int vmu_lcd_bwrite(DCVmu *v, const uint8_t *data, int datalen,
+                          uint8_t host, uint8_t dev, uint8_t *buf)
+{
+    if (datalen < 8 + LCD_FB_SIZE) {
+        return -1;
+    }
+    memcpy(v->lcd_fb, &data[8], LCD_FB_SIZE);
+    v->redraw = true;
+
+    buf[0] = RESP_OK;
+    buf[1] = host;
+    buf[2] = dev;
+    buf[3] = 0;
+    return 4;
+}
+
+/* ---- storage function -------------------------------------------------- */
+
+/* DEVINFO: report the memory-card function (+ LCD when enabled). */
+static int vmu_devinfo(DCVmu *v, uint8_t host, uint8_t dev, uint8_t *buf)
+{
+    uint32_t function = FUNC_MEMCARD | (v->lcd_enabled ? FUNC_LCD : 0);
+
     memset(buf, 0, 116);
     buf[0] = RESP_DEVINFO;
     buf[1] = host;
     buf[2] = dev;
     buf[3] = 28;                    /* payload length in words */
-    st_be32(&buf[4], FUNC_MEMCARD);
+    st_be32(&buf[4], function);
     /*
-     * function_data[0], decoded by vmu_connect():
+     * function_data is ordered high-bit-first, and vmu-flash reads the storage
+     * word at index hweight(function)-1.  With the LCD present that is index 1,
+     * so LCD data goes first.  vmu-flash decodes the storage word as:
      *   partitions = (b>>24)+1 = 1, blocklen = ((b>>16 & 0xff)+1)<<5 = 512,
      *   writecnt = b>>12 & 0xf = 4, readcnt = b>>8 & 0xf = 1.
      */
-    st_be32(&buf[8], 0x000f4100);
+    if (v->lcd_enabled) {
+        st_be32(&buf[8],  0x00051000);   /* LCD (index 0; unused by driver) */
+        st_be32(&buf[12], 0x000f4100);   /* storage (index 1)               */
+    } else {
+        st_be32(&buf[8],  0x000f4100);   /* storage (index 0)               */
+    }
     buf[20] = 0xff;                /* area code             */
     buf[21] = 0x00;               /* connector direction   */
     memset(&buf[22], ' ', 30);
@@ -109,11 +241,6 @@ static int vmu_getminfo(uint8_t host, uint8_t dev, uint8_t *buf)
     return 32;
 }
 
-/*
- * BREAD: data = [func][addr]; addr = partition<<24 | phase<<16 | block.
- * With readcnt=1 the whole 512-byte block is returned in one frame, with the
- * data placed at response byte 12 (vmu_blockread reads recvbuf->buf + 12).
- */
 static int vmu_bread(DCVmu *v, const uint8_t *data, int datalen,
                      uint8_t host, uint8_t dev, uint8_t *buf)
 {
@@ -142,11 +269,7 @@ static int vmu_bread(DCVmu *v, const uint8_t *data, int datalen,
     return 12 + VMU_BLOCK_SIZE;
 }
 
-/*
- * BWRITE: data = [func][addr][128 bytes]; write one 128-byte phase directly
- * to its slice of the block.  (A block is written as writecnt=4 phases, each
- * a distinct 128-byte region, so no accumulation buffer is needed.)
- */
+/* Storage BWRITE: one 128-byte phase written directly to its slice. */
 static int vmu_bwrite(DCVmu *v, const uint8_t *data, int datalen,
                       uint8_t host, uint8_t dev, uint8_t *buf)
 {
@@ -184,22 +307,27 @@ static int vmu_bsync(DCVmu *v, uint8_t host, uint8_t dev, uint8_t *buf)
 }
 
 /*
- * Handle one storage-function Maple frame addressed to the VMU.  Returns the
- * response length in bytes, or <=0 to signal "no/So error response" (the
- * caller then writes a RESP_NONE).  data/datalen are the raw command data
- * bytes (data[0..3] = function, big-endian).
+ * Handle one Maple frame addressed to the VMU sub-unit.  Returns the response
+ * length, or <=0 for "no/error response".  data/datalen are the raw command
+ * data bytes; data[0..3] is the function code (big-endian), which selects the
+ * memory-card vs LCD function for block writes.
  */
 int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
                  const uint8_t *data, int datalen, uint8_t *resp)
 {
     switch (cmd) {
     case CMD_DEVINFO:
-        return vmu_devinfo(host, dev, resp);
+        return vmu_devinfo(v, host, dev, resp);
     case CMD_GETMINFO:
         return vmu_getminfo(host, dev, resp);
     case CMD_BREAD:
         return vmu_bread(v, data, datalen, host, dev, resp);
     case CMD_BWRITE:
+        if (datalen >= 4 && v->lcd_enabled &&
+            data[0] == 0 && data[1] == 0 && data[2] == 0 &&
+            data[3] == FUNC_LCD) {
+            return vmu_lcd_bwrite(v, data, datalen, host, dev, resp);
+        }
         return vmu_bwrite(v, data, datalen, host, dev, resp);
     case CMD_BSYNC:
         return vmu_bsync(v, host, dev, resp);
@@ -209,26 +337,81 @@ int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
     }
 }
 
-/* Create a VMU backed by blk (must be a 128 KB image). */
-DCVmu *dc_vmu_new(BlockBackend *blk)
+/* ---- QOM device -------------------------------------------------------- */
+
+static void vmu_realize(DeviceState *dev, Error **errp)
 {
-    DCVmu *v;
+    DCVmu *v = DC_VMU(dev);
     int64_t len;
 
-    len = blk_getlength(blk);
+    if (!v->blk) {
+        error_setg(errp, "dc-vmu: no block backend connected");
+        return;
+    }
+    len = blk_getlength(v->blk);
     if (len != VMU_SIZE) {
-        error_report("dc-vmu: image must be exactly %d bytes (128 KB), got %"
-                     PRId64, VMU_SIZE, len);
-        exit(1);
+        error_setg(errp, "dc-vmu: image must be exactly %d bytes (128 KB), "
+                   "got %" PRId64, VMU_SIZE, len);
+        return;
+    }
+    if (blk_set_perm(v->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                     BLK_PERM_ALL, errp) < 0) {
+        return;
     }
 
-    /* We read and write the flash; request those permissions on the backend. */
-    if (blk_set_perm(blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
-                     BLK_PERM_ALL, &error_fatal) < 0) {
-        exit(1);
+    if (v->lcd_enabled) {
+        memset(v->lcd_fb, 0, sizeof(v->lcd_fb));
+        v->redraw = true;
+        v->con = qemu_graphic_console_create(dev, 0, &vmu_lcd_ops, v);
+        qemu_console_resize(v->con, LCD_WIDTH * LCD_MAGNIFY,
+                            LCD_HEIGHT * LCD_MAGNIFY);
     }
+}
 
-    v = g_new0(DCVmu, 1);
+static const VMStateDescription vmstate_vmu = {
+    .name = "dc-vmu",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(lcd_fb, DCVmu, LCD_FB_SIZE),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void vmu_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->realize = vmu_realize;
+    dc->vmsd = &vmstate_vmu;
+    dc->user_creatable = false;
+}
+
+static const TypeInfo vmu_info = {
+    .name          = TYPE_DC_VMU,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(DCVmu),
+    .class_init    = vmu_class_init,
+};
+
+static void vmu_register_types(void)
+{
+    type_register_static(&vmu_info);
+}
+
+type_init(vmu_register_types)
+
+/* Create a VMU backed by blk (a 128 KB image); enable the LCD console if lcd. */
+DCVmu *dc_vmu_new(BlockBackend *blk, bool lcd)
+{
+    DeviceState *dev = qdev_new(TYPE_DC_VMU);
+    DCVmu *v = DC_VMU(dev);
+
     v->blk = blk;
+    v->lcd_enabled = lcd;
+    /* Give it a stable id so the LCD console can be targeted by
+     * "screendump -d vmu" / QMP screendump device=vmu. */
+    dev->id = g_strdup("vmu");
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     return v;
 }

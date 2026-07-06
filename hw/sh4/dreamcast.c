@@ -601,6 +601,14 @@ static uint64_t dc_kernel_translate(void *opaque, uint64_t addr)
     return addr & 0x1fffffff;
 }
 
+#define TYPE_DREAMCAST_MACHINE MACHINE_TYPE_NAME("dreamcast")
+OBJECT_DECLARE_SIMPLE_TYPE(DreamcastMachineState, DREAMCAST_MACHINE)
+
+struct DreamcastMachineState {
+    MachineState parent_obj;
+    bool vmu_lcd;               /* present the VMU LCD as a second display */
+};
+
 static void dreamcast_init(MachineState *machine)
 {
     const char *kernel_filename = machine->kernel_filename;
@@ -678,7 +686,9 @@ static void dreamcast_init(MachineState *machine)
      */
     dinfo = drive_get(IF_NONE, 0, 1);
     dc_maple_init(MAPLE_BASE, holly_event_irq(holly, HOLLY_EV_MAPLE_DMA),
-                  dinfo ? dc_vmu_new(blk_by_legacy_dinfo(dinfo)) : NULL);
+                  dinfo ? dc_vmu_new(blk_by_legacy_dinfo(dinfo),
+                                     DREAMCAST_MACHINE(machine)->vmu_lcd)
+                        : NULL);
 
     /*
      * Load the kernel.  The Dreamcast Linux vmlinux is an SH ELF linked in the
@@ -749,6 +759,16 @@ static void dreamcast_init(MachineState *machine)
     }
 }
 
+static bool dreamcast_get_vmu_lcd(Object *obj, Error **errp)
+{
+    return DREAMCAST_MACHINE(obj)->vmu_lcd;
+}
+
+static void dreamcast_set_vmu_lcd(Object *obj, bool value, Error **errp)
+{
+    DREAMCAST_MACHINE(obj)->vmu_lcd = value;
+}
+
 static void dreamcast_machine_init(MachineClass *mc)
 {
     mc->desc = "Sega Dreamcast";
@@ -756,6 +776,13 @@ static void dreamcast_machine_init(MachineClass *mc)
     /* The SH7091 is an SH7750-class core; reuse sh7750r until a dedicated
      * sh7091 CPU type is added.  MMU/TLB behaviour is identical. */
     mc->default_cpu_type = TYPE_SH7750R_CPU;
+
+    object_class_property_add_bool(OBJECT_CLASS(mc), "vmu-lcd",
+                                   dreamcast_get_vmu_lcd,
+                                   dreamcast_set_vmu_lcd);
+    object_class_property_set_description(OBJECT_CLASS(mc), "vmu-lcd",
+        "Show the VMU LCD as a second display (needs a VMU -drive)");
 }
 
-DEFINE_MACHINE("dreamcast", dreamcast_machine_init)
+DEFINE_MACHINE_EXTENDED("dreamcast", MACHINE, DreamcastMachineState,
+                        dreamcast_machine_init, false, NULL)

@@ -41,6 +41,21 @@ dd if=/dev/zero of=vmu.bin bs=1024 count=128
 Inside Linux the flash is at `/dev/mtd0` and can be formatted/mounted with
 `vmufat`. Writes persist back to `vmu.bin` on the host.
 
+## VMU LCD
+
+The VMU's 48x32 monochrome LCD can be shown as a **second display** (a separate
+GTK tab / SDL window). It is opt-in via the `vmu-lcd=on` machine option and
+needs a VMU `-drive`:
+
+```
+-M dreamcast,vmu-lcd=on
+```
+
+The kernel registers it as `/dev/vmu_lcd0`; write exactly 192 bytes (48x32,
+1bpp, MSB first) to update it, e.g. the driver draws a Tux splash on attach.
+With `-display none` the LCD console can be captured over QMP/monitor with
+`screendump file.ppm -d vmu` (the VMU device id is `vmu`).
+
 
 # Supports
 
@@ -51,3 +66,4 @@ Inside Linux the flash is at `/dev/mtd0` and can be formatted/mounted with
 - X Framebuffer
 - Maple Keyboard, Mouse
 - VMU (Visual Memory) as an MTD / block device
+- VMU LCD as a second display (`vmu-lcd=on`)
