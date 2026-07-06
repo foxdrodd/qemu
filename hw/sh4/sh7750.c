@@ -246,6 +246,11 @@ static uint32_t sh7750_mem_readl(void *opaque, hwaddr addr)
         return s->cpu->env.intevt;
     case SH7750_CCR_A7:
         return s->ccr;
+    case SH7750_PCTRA_A7:
+        return s->pctra;
+    case SH7750_PDTRA_A7:
+        /* The Dreamcast reads PDTRA as a long during video-cable detection. */
+        return porta_lines(s);
     case 0x1f000030: /* Processor version */
         scc = SUPERH_CPU_GET_CLASS(s->cpu);
         return scc->pvr;
