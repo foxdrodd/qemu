@@ -277,6 +277,15 @@ static void sh7750_mem_writeb(void *opaque, hwaddr addr,
         return;
     }
 
+    switch (addr) {
+    case 0x1fc00004: /* STBCR  - standby control  */
+    case 0x1fc00010: /* STBCR2 - standby control 2 */
+        /* Module standby bits; no emulated power management. The Dreamcast
+         * 1ST_READ.BIN bootstrap clears STBCR on entry. */
+        ignore_access("byte write", addr);
+        return;
+    }
+
     error_access("byte write", addr);
     abort();
 }

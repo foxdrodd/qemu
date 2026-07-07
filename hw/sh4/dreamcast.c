@@ -266,8 +266,14 @@ typedef struct GdromState {
     QEMUTimer *cmd_timer;
     QEMUTimer *dma_timer;
     BlockBackend *blk;
-    uint32_t n_sectors;             /* disc image size in 2048-byte sectors */
+    uint32_t n_sectors;             /* data-track length in 2048-byte sectors */
     uint32_t data_lba;              /* data-track start LBA */
+    /* Physical geometry of the data track inside the image. Raw ISO:
+     * off=0, raw=2048, hdr=0 (flat). CDI (cdi4dc Mode2/Form1): off=byte
+     * offset of the LBA-0 sector, raw=2336 stored sector, hdr=8 subheader. */
+    uint64_t data_off;              /* byte offset of data-track sector 0 */
+    uint32_t raw_size;              /* stored bytes per sector */
+    uint32_t sec_hdr;              /* bytes before the 2048 user data */
 
     uint8_t status;
     uint8_t error;
@@ -393,7 +399,8 @@ static void gdrom_do_dma(GdromState *s)
 
         memset(sec, 0, sizeof(sec));
         if (s->blk && fad >= data_fad && rel < s->n_sectors) {
-            blk_pread(s->blk, (int64_t)rel * GDROM_SECTOR, GDROM_SECTOR, sec, 0);
+            int64_t off = s->data_off + (int64_t)rel * s->raw_size + s->sec_hdr;
+            blk_pread(s->blk, off, GDROM_SECTOR, sec, 0);
         }
         dma_memory_write(&address_space_memory, addr, sec, GDROM_SECTOR,
                          MEMTXATTRS_UNSPECIFIED);
@@ -568,6 +575,75 @@ static const MemoryRegionOps gdrom_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* CDI (cdi4dc) data-track geometry: Mode2/Form1 stored as 2336-byte sectors,
+ * with 8 subheader bytes before the 2048 user bytes. */
+#define CDI_RAW_SIZE  2336
+#define CDI_SEC_HDR   8
+#define ISO_PVD_LBA   16            /* ISO9660 PVD at data-track sector 16 */
+#define DISC_SCAN_WIN (8 << 20)     /* PVD lives ~1.4 MB in; 8 MB is safe */
+
+/* Detect the image type and fill the data-track geometry. Defaults to a flat
+ * raw ISO (off=0, 2048/sector). Detection is structural (size-independent, so
+ * it survives the block layer padding the image up to a 512-byte boundary): we
+ * scan for the ISO9660 primary volume descriptor ("\x01CD001") and read the
+ * following volume-descriptor-set terminator ("\xffCD001"). The stride between
+ * them is the stored sector size - 2048 for a flat ISO, 2336 for a cdi4dc CDI
+ * (Mode2/Form1: 8-byte subheader + 2048 user + EDC/ECC). */
+static void gdrom_probe_disc(GdromState *s)
+{
+    int64_t len;
+    uint8_t *win;
+    size_t winlen, i;
+
+    /* flat-ISO defaults */
+    s->data_off = 0;
+    s->raw_size = GDROM_SECTOR;
+    s->sec_hdr = 0;
+    s->data_lba = GDROM_DATA_LBA;
+
+    if (!s->blk) {
+        return;
+    }
+    len = blk_getlength(s->blk);
+    if (len <= 0) {
+        return;
+    }
+    s->n_sectors = len / GDROM_SECTOR;
+
+    winlen = MIN(len, DISC_SCAN_WIN);
+    win = g_malloc(winlen);
+    if (blk_pread(s->blk, 0, winlen, win, 0) < 0) {
+        g_free(win);
+        return;
+    }
+    for (i = 0; i + 6 <= winlen; i++) {
+        size_t pvd = i;
+        int64_t off;
+
+        if (win[i] != 0x01 || memcmp(&win[i + 1], "CD001", 5) != 0) {
+            continue;
+        }
+        if (lduw_le_p(&win[pvd + 128]) != GDROM_SECTOR) {
+            break;                  /* PVD without 2048 block size - give up */
+        }
+        /* Only a CDI needs remapping; a flat ISO already matches the defaults.
+         * Distinguish by the terminator stride. */
+        if (pvd + CDI_RAW_SIZE + 6 <= winlen &&
+            win[pvd + CDI_RAW_SIZE] == 0xff &&
+            memcmp(&win[pvd + CDI_RAW_SIZE + 1], "CD001", 5) == 0) {
+            off = (int64_t)pvd - CDI_SEC_HDR - (int64_t)ISO_PVD_LBA * CDI_RAW_SIZE;
+            if (off >= 0) {
+                s->data_off = off;
+                s->raw_size = CDI_RAW_SIZE;
+                s->sec_hdr = CDI_SEC_HDR;
+                s->n_sectors = ldl_le_p(&win[pvd + 80]); /* PVD vol size */
+            }
+        }
+        break;
+    }
+    g_free(win);
+}
+
 static GdromState *gdrom_init(MemoryRegion *sysmem, qemu_irq irq_cmd,
                               qemu_irq irq_dma, BlockBackend *blk)
 {
@@ -582,17 +658,158 @@ static GdromState *gdrom_init(MemoryRegion *sysmem, qemu_irq irq_cmd,
     s->cmd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gdrom_cmd_complete, s);
     s->dma_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gdrom_dma_complete, s);
 
-    if (blk) {
-        int64_t len = blk_getlength(blk);
-        if (len > 0) {
-            s->n_sectors = len / GDROM_SECTOR;
-        }
-    }
+    gdrom_probe_disc(s);
 
     memory_region_init_io(&s->iomem, NULL, &gdrom_ops, s, "dc-gdrom",
                           GDROM_SIZE);
     memory_region_add_subregion(sysmem, GDROM_BASE, &s->iomem);
     return s;
+}
+
+/* Read `nsec` logical 2048-byte sectors from session LBA `lba` into buf,
+ * honouring the data-track geometry probed above. */
+static bool gdrom_read_logical(GdromState *s, uint32_t lba, uint32_t nsec,
+                               uint8_t *buf)
+{
+    uint32_t k;
+
+    if (!s->blk) {
+        return false;
+    }
+    for (k = 0; k < nsec; k++) {
+        int64_t rel = (int64_t)lba + k - s->data_lba;
+        int64_t off;
+
+        if (rel < 0) {
+            return false;
+        }
+        off = s->data_off + rel * s->raw_size + s->sec_hdr;
+        if (blk_pread(s->blk, off, GDROM_SECTOR, buf + k * GDROM_SECTOR, 0) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * 1ST_READ.BIN descrambler - the exact inverse of sh-boot's scramble.c, which
+ * the DC BIOS/IP.BIN normally performs.  A 16-bit LCG drives a Fisher-Yates
+ * shuffle of 32-byte slices, over windows shrinking from 2 MB down to 32 bytes.
+ */
+#define DC_SCRAMBLE_MAXCHUNK (2048 * 1024)
+
+static uint32_t dc_scr_seed;
+
+static uint32_t dc_scr_rand(void)
+{
+    dc_scr_seed = (dc_scr_seed * 2109 + 9273) & 0x7fff;
+    return (dc_scr_seed + 0xc000) & 0xffff;
+}
+
+static void dc_descramble(const uint8_t *src, uint8_t *dst, uint32_t size)
+{
+    uint32_t filesz = size, chunksz;
+    const uint8_t *sp = src;
+    uint8_t *dp = dst;
+    int *idx = g_new(int, DC_SCRAMBLE_MAXCHUNK / 32);
+
+    dc_scr_seed = size & 0xffff;
+    for (chunksz = DC_SCRAMBLE_MAXCHUNK; chunksz >= 32; chunksz >>= 1) {
+        while (filesz >= chunksz) {
+            int sz = chunksz / 32, i;
+
+            for (i = 0; i < sz; i++) {
+                idx[i] = i;
+            }
+            for (i = sz - 1; i >= 0; --i) {
+                uint32_t x = (dc_scr_rand() * (uint32_t)i) >> 16;
+                int tmp = idx[i];
+                idx[i] = idx[x];
+                idx[x] = tmp;
+                memcpy(dp + 32 * idx[i], sp, 32);
+                sp += 32;
+            }
+            filesz -= chunksz;
+            dp += chunksz;
+        }
+    }
+    if (filesz) {                       /* trailing partial slice, verbatim */
+        memcpy(dp, sp, filesz);
+    }
+    g_free(idx);
+}
+
+/*
+ * Boot a self-contained disc the way the BIOS would: find 1ST_READ.BIN in the
+ * ISO9660 root directory, descramble it, and stage it at its 0x8c010000 load
+ * address.  Returns the entry PC, or 0 if the disc is not bootable.  (Dreamcast
+ * Linux's 1ST_READ.BIN carries the kernel + boot params and reads its rootfs
+ * over the hardware GD-ROM registers, so no BIOS syscall HLE is required.)
+ */
+static uint64_t dc_boot_disc(GdromState *s)
+{
+    uint8_t sec[GDROM_SECTOR];
+    uint8_t *dirbuf, *filebuf, *dst;
+    uint32_t root_lba, root_size, file_lba = 0, file_size = 0, nsec, pos;
+
+    if (!s->blk) {
+        return 0;
+    }
+    /* Primary Volume Descriptor at data-track sector 16; the root directory
+     * record is the 34-byte field at PVD offset 156. */
+    if (!gdrom_read_logical(s, s->data_lba + ISO_PVD_LBA, 1, sec) ||
+        sec[0] != 0x01 || memcmp(&sec[1], "CD001", 5) != 0) {
+        return 0;
+    }
+    root_lba  = ldl_le_p(&sec[156 + 2]);
+    root_size = ldl_le_p(&sec[156 + 10]);
+    if (!root_size) {
+        return 0;
+    }
+
+    nsec = DIV_ROUND_UP(root_size, GDROM_SECTOR);
+    dirbuf = g_malloc(nsec * GDROM_SECTOR);
+    if (!gdrom_read_logical(s, root_lba, nsec, dirbuf)) {
+        g_free(dirbuf);
+        return 0;
+    }
+    for (pos = 0; pos < root_size; ) {
+        uint8_t rlen = dirbuf[pos];
+        uint8_t nlen;
+        const char *nm;
+
+        if (rlen < 34) {                /* zero-pad up to the next sector */
+            pos = ROUND_UP(pos + 1, GDROM_SECTOR);
+            continue;
+        }
+        nlen = dirbuf[pos + 32];
+        nm = (const char *)&dirbuf[pos + 33];
+        if (nlen >= 12 && !g_ascii_strncasecmp(nm, "1ST_READ.BIN", 12)) {
+            file_lba  = ldl_le_p(&dirbuf[pos + 2]);
+            file_size = ldl_le_p(&dirbuf[pos + 10]);
+            break;
+        }
+        pos += rlen;
+    }
+    g_free(dirbuf);
+    if (!file_size) {
+        return 0;
+    }
+
+    nsec = DIV_ROUND_UP(file_size, GDROM_SECTOR);
+    filebuf = g_malloc(nsec * GDROM_SECTOR);
+    if (!gdrom_read_logical(s, file_lba, nsec, filebuf)) {
+        g_free(filebuf);
+        return 0;
+    }
+    dst = g_malloc(file_size);
+    dc_descramble(filebuf, dst, file_size);
+    /* 0x8c010000 -> physical SDRAM_BASE + 0x10000; a ROM blob so it survives
+     * the CPU reset that copies ROM images into RAM. */
+    rom_add_blob_fixed("dc.1st_read", dst, file_size, SDRAM_BASE + 0x10000);
+    g_free(filebuf);
+    g_free(dst);
+    return 0x8c010000;
 }
 
 /* Map SH-4 P1/P2 kernel virtual addresses (0x8xxxxxxx / 0xAxxxxxxx) to RAM. */
@@ -617,6 +834,7 @@ static void dreamcast_init(MachineState *machine)
     ResetData *reset_info;
     struct SH7750State *s;
     HollyState *holly;
+    GdromState *gd;
     DriveInfo *dinfo;
     MemoryRegion *address_space_mem = get_system_memory();
     MemoryRegion *sdram = g_new(MemoryRegion, 1);
@@ -659,10 +877,10 @@ static void dreamcast_init(MachineState *machine)
     /* GD-ROM drive on the G1 bus, interrupts routed through Holly.
      * The disc image is supplied via -drive if=none,file=<disc>. */
     dinfo = drive_get(IF_NONE, 0, 0);
-    gdrom_init(address_space_mem,
-               holly_event_irq(holly, HOLLY_EV_GDROM_CMD),
-               holly_event_irq(holly, HOLLY_EV_GDROM_DMA),
-               dinfo ? blk_by_legacy_dinfo(dinfo) : NULL);
+    gd = gdrom_init(address_space_mem,
+                    holly_event_irq(holly, HOLLY_EV_GDROM_CMD),
+                    holly_event_irq(holly, HOLLY_EV_GDROM_DMA),
+                    dinfo ? blk_by_legacy_dinfo(dinfo) : NULL);
 
     /*
      * G2 networking.  The Broadband Adapter (RTL8139 behind the GAPS PCI
@@ -715,13 +933,23 @@ static void dreamcast_init(MachineState *machine)
             exit(1);
         }
         reset_info->vector = entry;
+    } else {
+        /* No -kernel: boot the disc itself (descramble 1ST_READ.BIN). */
+        uint64_t entry = dc_boot_disc(gd);
 
-        /* Basic bus-state config the firmware would normally do (cs3 SDRAM). */
-        address_space_stl(&address_space_memory, SH7750_BCR1, 1 << 3,
-                          MEMTXATTRS_UNSPECIFIED, NULL);
-        address_space_stw(&address_space_memory, SH7750_BCR2, 3 << (3 * 2),
-                          MEMTXATTRS_UNSPECIFIED, NULL);
+        if (!entry) {
+            error_report("qemu: no -kernel and no bootable disc "
+                         "(1ST_READ.BIN not found)");
+            exit(1);
+        }
+        reset_info->vector = entry;
     }
+
+    /* Basic bus-state config the firmware would normally do (cs3 SDRAM). */
+    address_space_stl(&address_space_memory, SH7750_BCR1, 1 << 3,
+                      MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stw(&address_space_memory, SH7750_BCR2, 3 << (3 * 2),
+                      MEMTXATTRS_UNSPECIFIED, NULL);
 
     /*
      * Optional initrd / initramfs.  The SH kernel reads INITRD_START and

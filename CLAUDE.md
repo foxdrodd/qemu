@@ -41,8 +41,10 @@ Prefer the `make run-*` targets in the harness dir. Direct invocation essentials
   `-serial null -serial <sink>`; the first slot is unused. Quit with `Ctrl-A X`.
 - Kernel: `…/dreamcast-linux/.dreamcast/src/linux-7.1.3/vmlinux` (SH ELF, load
   `0x8c000000`, entry `0x8c002000`, `console=ttySC1`, no DTB).
-- GD-ROM disc: `-drive if=none,file=<iso>,format=raw,readonly=on` (NOT `if=ide` —
-  no HBA). Appears as `/dev/gdrom`. ISO data track at LBA 11702.
+- GD-ROM disc: `-drive if=none,file=<iso|cdi>,format=raw,readonly=on` (NOT
+  `if=ide` — no HBA). Appears as `/dev/gdrom`. Data track at LBA 11702. Raw
+  `.iso` and DiscJuggler `.cdi` auto-detected; omit `-kernel` to boot the disc's
+  own `1ST_READ.BIN` (see "CDI images + boot-from-disc").
 - Network: `-nic user` gives the default Broadband Adapter (RTL8139);
   `-nic user,model=dc-lanadapter` selects the LAN adapter. Use `-nic` (not a
   bare `-netdev`, which leaves the NIC peerless and drops packets).
@@ -182,6 +184,42 @@ Gotchas:
 - The kernel draws the splash from a **workqueue** (never from maple probe
   context), so it appears a beat after `vmu_lcd0` registers.
 
+## CDI images + boot-from-disc — DONE
+
+All in `hw/sh4/dreamcast.c`. Two capabilities:
+
+1. **`.cdi` disc images** (DiscJuggler, `cdi4dc` output) alongside raw `.iso`.
+   `gdrom_probe_disc()` fills the data-track geometry `{data_off, raw_size,
+   sec_hdr}`; `gdrom_do_dma`/`gdrom_read_logical` read
+   `data_off + rel*raw_size + sec_hdr`. Raw ISO = `{0, 2048, 0}` (unchanged);
+   CDI Mode2/Form1 = `{PVD-derived, 2336, 8}`.
+2. **Boot from disc with no `-kernel`**: `dc_boot_disc()` parses ISO9660, finds
+   `1ST_READ.BIN`, `dc_descramble()`s it, stages it at `0x8c010000` (a
+   `rom_add_blob_fixed` so it survives reset), sets the reset vector there.
+
+Gotchas:
+- **Detection is structural, not by footer.** The block layer rounds
+  `blk_getlength` up to 512, so the CDI version dword at real-EOF−8 reads back
+  as zero padding — unusable. Instead scan for the ISO9660 PVD (`\x01CD001`) and
+  read the VDS terminator (`\xffCD001`) that follows: stride **2048 → flat ISO**,
+  stride **2336 → CDI**. `data_off = pvd_pos − 8 − 16*2336`.
+- CDI data track is Mode2/Form1 stored as **2336 bytes/sector** (no 16-byte
+  sync/header; 8-byte subheader, then 2048 user, then EDC/ECC). User data is at
+  **offset 8**. Track starts at LBA **11702** (`genisoimage -C 0,11702`, matches
+  `GDROM_DATA_LBA`); ISO extents are session-absolute (11702-based) so
+  `rel = lba − data_lba`.
+- **Descramble** = exact inverse of sh-boot `scramble.c`: 16-bit LCG
+  (`seed=(seed*2109+9273)&0x7fff`, `ret=(seed+0xc000)&0xffff`), seed =
+  `filesize & 0xffff` (set **once**), Fisher-Yates over 32-byte slices, windows
+  2 MB→32 B. Verified byte-identical to the pre-scramble `kernel-boot.bin`.
+- `1ST_READ.BIN` (= sh-boot `kernel-boot` stub + appended `zImage`) is linked
+  at and entered from **`0x8c010000`**; it is self-contained (copies zImage to
+  `0xac600000`, sets boot params at `0x8c001000`, jumps `0x8c600000`) and reads
+  rootfs via the **hardware GD-ROM driver** — so **no BIOS syscall HLE** needed.
+- kernel-boot does a **byte** write to **STBCR (`0xffc00004`)**; `sh7750.c`'s
+  `sh7750_mem_writeb` used to `abort()` on it — now ignored (also STBCR2
+  `0xffc00010`). The `-kernel` path never hit this.
+
 ## Status
 
 Working & verified: machine boot, Holly IRQs, serial console, GD-ROM rootfs mount
@@ -191,5 +229,7 @@ Maple keyboard, VGA-cable X (no duplication), Maple **mouse** (kernel detects
 **Broadband Adapter** (RTL8139 via GAPS PCI bridge, the default NIC: DHCP +
 ping 0% loss, mainline `8139too`), **VMU** (controller sub-unit, 128 KB MTD via
 mainline `vmu-flash`, second `-drive if=none`), **VMU LCD** (opt-in `vmu-lcd=on`
-second console: `function 0x6`, `vmu_lcd0`, Tux splash renders). Not done: AICA
-sound; PVR 3D/TA (not needed); VMU RTC sub-function.
+second console: `function 0x6`, `vmu_lcd0`, Tux splash renders), **CDI images +
+boot-from-disc** (raw `.iso` and DiscJuggler `.cdi` auto-detected; no-`-kernel`
+boot descrambles `1ST_READ.BIN` and runs it — musl & uclibc CDIs boot to shell).
+Not done: AICA sound; PVR 3D/TA (not needed); VMU RTC sub-function.

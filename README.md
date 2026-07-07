@@ -8,6 +8,22 @@
   -drive if=none,file=/home/flo/devel/t2-hacking/dreamcast/dreamcast-linux/build/linux-7.1.3-with-userland-musl.iso,format=raw,readonly=on
 ```
 
+## Disc image formats & booting from disc
+
+The `-drive` disc image may be either a **raw ISO9660** (`.iso`) or a
+**DiscJuggler `.cdi`** (audio session + scrambled data track, as produced by
+`cdi4dc`). The type is auto-detected.
+
+Passing `-kernel` boots that kernel and uses the disc only as the root
+filesystem. **Omit `-kernel`** to boot the disc itself the way a real Dreamcast
+does - the emulator finds `1ST_READ.BIN` in the ISO9660 root, descrambles it,
+and runs it from `0x8c010000`:
+
+```
+./build/qemu-system-sh4 -M dreamcast -m 16 -serial null -serial stdio \
+  -drive if=none,file=linux-7.1.3-with-userland-musl.cdi,format=raw,readonly=on
+```
+
 # NIC Support
 
 ## LAN Adapter
@@ -60,7 +76,7 @@ With `-display none` the LCD console can be captured over QMP/monitor with
 # Supports
 
 - Booting Linux with serial console
-- GDROM
+- GDROM (raw `.iso` and DiscJuggler `.cdi`; boot from disc via `1ST_READ.BIN`)
 - LAN Adapter Networking
 - BBA (RTL8139) Networking
 - X Framebuffer
