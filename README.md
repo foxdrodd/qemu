@@ -1,5 +1,27 @@
 # Boot Dreamcast Linux with QEMU
 
+## Build
+
+Only the `sh4-softmmu` target is needed. From the source root:
+
+```
+./configure --target-list=sh4-softmmu --enable-slirp --disable-docs
+ninja -C build qemu-system-sh4
+```
+
+`--enable-slirp` provides the user-mode network backend for the Broadband
+Adapter / LAN Adapter. The binary lands at `./build/qemu-system-sh4`. After
+editing sources, rebuild incrementally with `ninja -C build qemu-system-sh4`.
+
+Build dependencies are the usual QEMU ones (a C toolchain, `ninja`, `python3`,
+`glib` + `pixman` dev packages); on Debian/Ubuntu:
+
+```
+sudo apt install ninja-build python3 pkg-config libglib2.0-dev libpixman-1-dev
+```
+
+## Run
+
 ```
 ./build/qemu-system-sh4 \
   -M dreamcast -m 16 \
