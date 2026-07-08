@@ -1,5 +1,7 @@
 # Boot Dreamcast Linux with QEMU
 
+Boots the images of [Modern Linux on the Dreamcast](https://github.com/foxdrodd/dreamcast-linux) with qemu.
+
 ## Build
 
 Only the `sh4-softmmu` target is needed. From the source root:
