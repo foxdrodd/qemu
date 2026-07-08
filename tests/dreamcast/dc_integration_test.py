@@ -276,11 +276,19 @@ def scenario_vmu(cfg, res):
 
 
 def scenario_lcd(cfg, res):
-    """VMU LCD second display → screendump device 'vmu'."""
+    """VMU LCD second display → screendump device 'vmu'.
+
+    The VMU device (and thus its LCD console) only exists when a VMU *drive* is
+    attached — vmu-lcd=on alone creates nothing. So we must attach a card too.
+    """
     if not os.path.exists(cfg.iso):
         res.add("VMU LCD screendump", FAIL, "iso missing")
         return
-    dc = DCBoot(kernel=cfg.kernel, drives=[cfg.iso], vmu_lcd=True, qemu=cfg.qemu)
+    vmu = os.path.join(cfg.artdir, "vmu-lcd.bin")
+    with open(vmu, "wb") as f:
+        f.truncate(128 * 1024)
+    dc = DCBoot(kernel=cfg.kernel, drives=[cfg.iso], vmu=vmu, vmu_lcd=True,
+                qemu=cfg.qemu)
     try:
         try:
             dc.boot(timeout=cfg.boot_timeout)
@@ -288,13 +296,26 @@ def scenario_lcd(cfg, res):
             res.add("VMU LCD: boot vmu-lcd=on", FAIL, str(e))
             return
 
+        # The LCD is a 48x32 mono panel exposed as /dev/vmu_lcd0 (192 bytes).
+        res.check("VMU LCD: /dev/vmu_lcd0 present", lambda: has(
+            dc.run("ls /dev/vmu_lcd0 2>&1"), "/dev/vmu_lcd0"))
+
         def shot():
+            # Draw a deterministic non-uniform pattern so the frame is
+            # guaranteed non-blank (proves guest write -> maple LCD BWRITE ->
+            # console surface -> screendump end to end), independent of whatever
+            # the distro itself paints at boot.
+            dc.run("dd if=/dev/urandom of=/dev/vmu_lcd0 bs=192 count=1 "
+                   "2>/dev/null")
+            time.sleep(1)
             ppm = os.path.join(cfg.artdir, "vmu-lcd.ppm")
-            need(dc.screendump(ppm, "vmu"), "no LCD screendump file")
-            w, h, _px = parse_ppm(ppm)
+            need(dc.screendump(ppm, "vmu"), "no LCD screendump file "
+                 "(is the VMU device present / id 'vmu' resolvable?)")
+            w, h, px = parse_ppm(ppm)
             need(w > 0 and h > 0, "bad LCD PPM %dx%d" % (w, h))
+            need(ppm_distinct_pixels(px) > 1, "LCD frame is blank/solid")
             return True
-        res.check("VMU LCD: valid screendump", shot)
+        res.check("VMU LCD: renders a non-blank image", shot)
     finally:
         dc.close()
 
@@ -367,12 +388,12 @@ def main():
     print("  cdi:    %s\n" % cfg.cdi)
 
     scenarios = [scenario_core, scenario_selfboot]
-    if not cfg.quick:
-        scenarios += [scenario_vmu]
-        if cfg.with_lcd:
-            scenarios.append(scenario_lcd)
-        if cfg.with_audio:
-            scenarios.append(scenario_audio)
+    if not cfg.quick:                       # --quick = boot smoke only
+        scenarios.append(scenario_vmu)
+    if cfg.with_lcd:                         # explicit opt-ins always run
+        scenarios.append(scenario_lcd)
+    if cfg.with_audio:
+        scenarios.append(scenario_audio)
 
     for sc in scenarios:
         try:

@@ -410,7 +410,9 @@ DCVmu *dc_vmu_new(BlockBackend *blk, bool lcd)
     v->blk = blk;
     v->lcd_enabled = lcd;
     /* Give it a stable id so the LCD console can be targeted by
-     * "screendump -d vmu" / QMP screendump device=vmu. */
+     * "screendump <file> vmu" / QMP screendump device=vmu.  screendump resolves
+     * the console via qdev_find_recursive(sysbus, "vmu"), which matches on
+     * dev->id across the system bus this device is realized onto below. */
     dev->id = g_strdup("vmu");
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     return v;
