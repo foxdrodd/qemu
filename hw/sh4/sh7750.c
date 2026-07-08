@@ -45,6 +45,8 @@ typedef struct SH7750State {
     MemoryRegion iomem_ff0;
     MemoryRegion iomem_1f8;
     MemoryRegion iomem_ff8;
+    MemoryRegion iomem_1fa;
+    MemoryRegion iomem_ffa;
     MemoryRegion iomem_1fc;
     MemoryRegion iomem_ffc;
     MemoryRegion mmct_iomem;
@@ -77,6 +79,19 @@ typedef struct SH7750State {
 
     /* Cache */
     uint32_t ccr;
+
+    /*
+     * On-chip DMAC (0xffa00000).  The registers are only latched: QEMU does
+     * not run DMAC transfers itself.  Board-level cascade engines (e.g. the
+     * Dreamcast Holly CH2 DMA, which drives channel 2 in DDT mode) fetch
+     * SAR via sh7750_dmac_sar() and report back through
+     * sh7750_dmac_transfer_done().
+     */
+    uint32_t dmac_sar[8];
+    uint32_t dmac_dar[8];
+    uint32_t dmac_tcr[8];
+    uint32_t dmac_chcr[8];
+    uint16_t dmaor;
 
     struct intc_desc intc;
 } SH7750State;
@@ -165,6 +180,60 @@ static void ignore_access(const char *kind, hwaddr addr)
             kind, regname(addr), addr);
 }
 
+/*
+ * On-chip DMAC register file (A7 window 0x1fa00000).  Channels 0-3 at
+ * +0x00..0x3f, DMAOR (16-bit) at +0x40, channels 4-7 (SH7750R/SH7751R)
+ * at +0x50..0x8f.  Each channel is SAR/DAR/DMATCR/CHCR on 16-byte stride.
+ */
+#define SH7750_DMAC_A7    0x1fa00000
+#define SH7750_DMAC_SIZE  0x100
+#define SH7750_DMAOR_OFS  0x40
+
+static bool sh7750_is_dmac(hwaddr addr)
+{
+    return addr >= SH7750_DMAC_A7 && addr < SH7750_DMAC_A7 + SH7750_DMAC_SIZE;
+}
+
+static uint32_t *sh7750_dmac_reg(SH7750State *s, hwaddr addr)
+{
+    unsigned ofs = addr - SH7750_DMAC_A7;
+    unsigned ch;
+
+    if (ofs >= 0x40 && ofs < 0x50) {
+        return NULL;                    /* DMAOR (word-access) / reserved */
+    }
+    ch = ofs < 0x40 ? ofs >> 4 : 4 + ((ofs - 0x50) >> 4);
+    if (ch >= ARRAY_SIZE(s->dmac_sar)) {
+        return NULL;
+    }
+    switch (ofs & 0xc) {
+    case 0x0:
+        return &s->dmac_sar[ch];
+    case 0x4:
+        return &s->dmac_dar[ch];
+    case 0x8:
+        return &s->dmac_tcr[ch];
+    default:
+        return &s->dmac_chcr[ch];
+    }
+}
+
+uint32_t sh7750_dmac_sar(SH7750State *s, unsigned channel)
+{
+    return s->dmac_sar[channel & 7];
+}
+
+/* A board-level engine finished a cascaded transfer on `channel`: advance
+ * SAR, zero the transfer count and set CHCR.TE, which is what the kernel's
+ * residue check (arch/sh/drivers/dma/dma-sh.c) expects of the hardware. */
+void sh7750_dmac_transfer_done(SH7750State *s, unsigned channel, uint32_t bytes)
+{
+    channel &= 7;
+    s->dmac_sar[channel] += bytes;
+    s->dmac_tcr[channel] = 0;
+    s->dmac_chcr[channel] |= 0x2;       /* TE: transfer end */
+}
+
 static uint32_t sh7750_mem_readb(void *opaque, hwaddr addr)
 {
     switch (addr) {
@@ -178,6 +247,13 @@ static uint32_t sh7750_mem_readw(void *opaque, hwaddr addr)
 {
     SH7750State *s = opaque;
 
+    if (addr == SH7750_DMAC_A7 + SH7750_DMAOR_OFS) {
+        return s->dmaor;
+    }
+    if (sh7750_is_dmac(addr)) {
+        ignore_access("word read", addr);
+        return 0;
+    }
     switch (addr) {
     case SH7750_BCR2_A7:
         return s->bcr2;
@@ -214,6 +290,10 @@ static uint32_t sh7750_mem_readl(void *opaque, hwaddr addr)
     SH7750State *s = opaque;
     SuperHCPUClass *scc;
 
+    if (sh7750_is_dmac(addr)) {
+        uint32_t *reg = sh7750_dmac_reg(s, addr);
+        return reg ? *reg : 0;
+    }
     switch (addr) {
     case SH7750_BCR1_A7:
         return s->bcr1;
@@ -296,6 +376,15 @@ static void sh7750_mem_writew(void *opaque, hwaddr addr,
     SH7750State *s = opaque;
     uint16_t temp;
 
+    if (addr == SH7750_DMAC_A7 + SH7750_DMAOR_OFS) {
+        /* Master enable; error flags (AE/NMIF) never latch in emulation. */
+        s->dmaor = mem_value;
+        return;
+    }
+    if (sh7750_is_dmac(addr)) {
+        ignore_access("word write", addr);
+        return;
+    }
     switch (addr) {
         /* SDRAM controller */
     case SH7750_BCR2_A7:
@@ -349,6 +438,15 @@ static void sh7750_mem_writel(void *opaque, hwaddr addr,
     SH7750State *s = opaque;
     uint16_t temp;
 
+    if (sh7750_is_dmac(addr)) {
+        uint32_t *reg = sh7750_dmac_reg(s, addr);
+        if (reg) {
+            *reg = mem_value;
+        } else {
+            ignore_access("long write", addr);
+        }
+        return;
+    }
     switch (addr) {
         /* SDRAM controller */
     case SH7750_BCR1_A7:
@@ -752,6 +850,14 @@ SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem)
     memory_region_init_alias(&s->iomem_ff8, NULL, "memory-ff8",
                              &s->iomem, 0x1f800000, 0x1000);
     memory_region_add_subregion(sysmem, 0xff800000, &s->iomem_ff8);
+
+    memory_region_init_alias(&s->iomem_1fa, NULL, "memory-1fa",
+                             &s->iomem, SH7750_DMAC_A7, SH7750_DMAC_SIZE);
+    memory_region_add_subregion(sysmem, 0x1fa00000, &s->iomem_1fa);
+
+    memory_region_init_alias(&s->iomem_ffa, NULL, "memory-ffa",
+                             &s->iomem, SH7750_DMAC_A7, SH7750_DMAC_SIZE);
+    memory_region_add_subregion(sysmem, 0xffa00000, &s->iomem_ffa);
 
     memory_region_init_alias(&s->iomem_1fc, NULL, "memory-1fc",
                              &s->iomem, 0x1fc00000, 0x1000);

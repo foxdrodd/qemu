@@ -44,6 +44,10 @@ struct SH7750State *sh7750_init(SuperHCPU *cpu, MemoryRegion *sysmem);
 /* sh7750.c */
 qemu_irq sh7750_irl(struct SH7750State *s);
 void sh7750_set_porta(struct SH7750State *s, uint16_t dir_mask, uint16_t value);
+/* On-chip DMAC latch, for board-level cascade engines (Dreamcast CH2 DMA). */
+uint32_t sh7750_dmac_sar(struct SH7750State *s, unsigned channel);
+void sh7750_dmac_transfer_done(struct SH7750State *s, unsigned channel,
+                               uint32_t bytes);
 
 /* hw/net/dreamcast_la.c */
 void dc_lanadapter_init(hwaddr base, qemu_irq irq);

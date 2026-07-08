@@ -187,6 +187,7 @@ static HollyState *holly_init(MemoryRegion *sysmem, qemu_irq irl)
 #define HOLLY_EV_VSYNC     5    /* ISTNRM bit  5 -> IRQ13 (video vblank) */
 #define HOLLY_EV_MAPLE_DMA 12   /* ISTNRM bit 12 -> IRQ13 */
 #define HOLLY_EV_GDROM_DMA 14   /* ISTNRM bit 14 -> IRQ13 */
+#define HOLLY_EV_CH2_DMA   19   /* ISTNRM bit 19 -> IRQ13 (PVR/CH2 DMA end) */
 #define HOLLY_EV_GDROM_CMD 32   /* ISTEXT bit  0 -> IRQ11 */
 #define HOLLY_EV_LAN       34   /* ISTEXT bit  2 -> IRQ11 (G2 external) */
 #define HOLLY_EV_EXTERNAL  35   /* ISTEXT bit  3 -> IRQ11 (BBA / GAPS PCI) */
@@ -199,6 +200,187 @@ static HollyState *holly_init(MemoryRegion *sysmem, qemu_irq irl)
 static qemu_irq holly_event_irq(HollyState *s, int event)
 {
     return &s->event[event];
+}
+
+/*
+ * Holly CH2 ("PVR") DMA.  The SH4 on-chip DMAC channel 2 is cascaded in DDT
+ * mode: the kernel latches the transfer source in SAR2 (arch/sh/drivers/dma/
+ * dma-sh.c) and programs this block (dma-pvr2.c, used by pvr2fb's fb_write)
+ * with the destination and byte count; writing 1 to SB_C2DST starts the
+ * transfer.  Completion raises Holly event 19 ("end of DMA: CH2") and
+ * reports back into the DMAC latch (TCR2 = 0, CHCR2.TE) so the kernel's
+ * residue check reads zero.
+ *
+ * Destination decoding: the texture-path windows 0x10000000-0x13ffffff map
+ * to VRAM (the 64/32-bit bus distinction and LMMODE interleave are not
+ * modelled); any other value is treated as a plain 29-bit bus address.  The
+ * latter makes the P2 framebuffer pointers the (unfixed) pvr2fb driver
+ * programs (0xa5xxxxxx) land in VRAM at 0x05xxxxxx, matching the "data
+ * arrives at the start of the visible framebuffer" behaviour seen on
+ * hardware.
+ */
+#define CH2DMA_BASE  0x005f6800
+#define CH2DMA_SIZE  0x100
+
+#define SB_C2DSTAT   0x00       /* destination address */
+#define SB_C2DLEN    0x04       /* byte count (32-byte units) */
+#define SB_C2DST     0x08       /* write 1: start; reads busy */
+#define SB_LMMODE0   0x84       /* 0x11000000 window bus width */
+#define SB_LMMODE1   0x88       /* 0x13000000 window bus width */
+
+#define CH2DMA_DELAY_NS 100000  /* ~0.1 ms transfer latency */
+
+typedef struct Ch2DmaState {
+    MemoryRegion iomem;
+    qemu_irq irq;
+    QEMUTimer *timer;
+    struct SH7750State *sh;     /* DMAC channel 2 cascade source */
+    uint32_t dstat;
+    uint32_t dlen;
+    uint32_t st;
+    uint32_t lmmode0, lmmode1;
+} Ch2DmaState;
+
+static void dc_ch2dma_complete(void *opaque)
+{
+    Ch2DmaState *s = opaque;
+
+    sh7750_dmac_transfer_done(s->sh, 2, s->dlen);
+    s->dstat += s->dlen;        /* hardware leaves the end address here */
+    s->dlen = 0;
+    s->st = 0;
+    qemu_set_irq(s->irq, 1);    /* Holly latches the ESR bit (edge) */
+}
+
+static void dc_ch2dma_kick(Ch2DmaState *s)
+{
+    uint32_t src = sh7750_dmac_sar(s->sh, 2) & 0x1fffffff;
+    uint32_t len = s->dlen & 0x00ffffe0;
+    uint32_t dst = s->dstat;
+    uint32_t off = 0;
+    int lm = -1;                /* -1: plain bus copy, else LMMODE for VRAM */
+    g_autofree uint8_t *buf = NULL;
+
+    /*
+     * Destination decode, verified against hardware with marker scans:
+     * the texture windows 0x11/0x13xxxxxx go to VRAM with the bus width
+     * chosen by SB_LMMODE0/1; a plain (masked) bus address in the VRAM
+     * areas -- which is what pvr2fb's P2 pointers become -- also goes
+     * through the LMMODE0 path.  LMMODE = 0 selects 64-bit access, which
+     * interleaves the two 4 MB banks per 32-bit word: stream offset A
+     * lands at 32-bit-area offset (A/8)*4, odd words in the second bank
+     * (+0x400000).  LMMODE = 1 is a linear 1:1 mapping.
+     */
+    if ((dst & 0x1c000000) == 0x10000000) {
+        off = dst & 0x00ffffff;
+        lm  = (dst & 0x02000000) ? s->lmmode1 : s->lmmode0;
+    } else {
+        uint32_t bus = dst & 0x1fffffe0;
+
+        if (bus >= 0x04000000 && bus < 0x06000000) {
+            off = bus & 0x00ffffff;
+            lm  = s->lmmode0;
+        } else {
+            dst = bus;
+        }
+    }
+    if (len) {
+        buf = g_malloc(len);
+        dma_memory_read(&address_space_memory, src, buf, len,
+                        MEMTXATTRS_UNSPECIFIED);
+        if (lm < 0) {
+            dma_memory_write(&address_space_memory, dst, buf, len,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else if (lm) {
+            dma_memory_write(&address_space_memory,
+                             VRAM_BASE + (off & (VRAM_SIZE - 1)), buf, len,
+                             MEMTXATTRS_UNSPECIFIED);
+        } else {
+            uint32_t i;
+
+            for (i = 0; i < len; i += 4) {
+                uint32_t a = off + i;
+                uint32_t vis = (((a >> 3) << 2) | (a & 3))
+                             + (((a >> 2) & 1) << 22);
+
+                dma_memory_write(&address_space_memory,
+                                 VRAM_BASE + (vis & (VRAM_SIZE - 1)),
+                                 buf + i, 4, MEMTXATTRS_UNSPECIFIED);
+            }
+        }
+    }
+    s->st = 1;
+    timer_mod(s->timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + CH2DMA_DELAY_NS);
+}
+
+static uint64_t dc_ch2dma_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Ch2DmaState *s = opaque;
+
+    switch (addr) {
+    case SB_C2DSTAT:
+        return s->dstat;
+    case SB_C2DLEN:
+        return s->dlen;
+    case SB_C2DST:
+        return s->st;
+    case SB_LMMODE0:
+        return s->lmmode0;
+    case SB_LMMODE1:
+        return s->lmmode1;
+    default:
+        return 0;
+    }
+}
+
+static void dc_ch2dma_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    Ch2DmaState *s = opaque;
+
+    switch (addr) {
+    case SB_C2DSTAT:
+        s->dstat = val;
+        break;
+    case SB_C2DLEN:
+        s->dlen = val;
+        break;
+    case SB_C2DST:
+        if ((val & 1) && !s->st) {
+            dc_ch2dma_kick(s);
+        }
+        break;
+    case SB_LMMODE0:
+        s->lmmode0 = val & 1;
+        break;
+    case SB_LMMODE1:
+        s->lmmode1 = val & 1;
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps dc_ch2dma_ops = {
+    .read = dc_ch2dma_read,
+    .write = dc_ch2dma_write,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static void dc_ch2dma_init(MemoryRegion *sysmem, struct SH7750State *sh,
+                           qemu_irq irq)
+{
+    Ch2DmaState *s = g_new0(Ch2DmaState, 1);
+
+    s->sh = sh;
+    s->irq = irq;
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dc_ch2dma_complete, s);
+    memory_region_init_io(&s->iomem, NULL, &dc_ch2dma_ops, s, "dc-ch2dma",
+                          CH2DMA_SIZE);
+    memory_region_add_subregion(sysmem, CH2DMA_BASE, &s->iomem);
 }
 
 /*
@@ -865,6 +1047,10 @@ static void dreamcast_init(MachineState *machine)
 
     /* Holly System ASIC interrupt controller, driving the SH-4 IRL lines. */
     holly = holly_init(address_space_mem, sh7750_irl(s));
+
+    /* Holly CH2 ("PVR") DMA: cascades SH4 DMAC channel 2 into VRAM. */
+    dc_ch2dma_init(address_space_mem, s,
+                   holly_event_irq(holly, HOLLY_EV_CH2_DMA));
 
     /*
      * Report a VGA video cable: port-A bits 8-9 both low select CT_VGA, which

@@ -220,6 +220,35 @@ Gotchas:
   `sh7750_mem_writeb` used to `abort()` on it — now ignored (also STBCR2
   `0xffc00010`). The `-kernel` path never hit this.
 
+## CH2 ("PVR") DMA + on-chip DMAC latch — DONE
+
+Why: `CONFIG_PVR2_DMA=y` makes pvr2fb's `fb_write` DMA userspace pages to VRAM
+(fbdoom blits frames via `write()` on `/dev/fb0`). Two cooperating blocks:
+
+- `hw/sh4/sh7750.c`: the on-chip **DMAC register file (0xffa00000/0x1fa00000)**
+  is now mapped (was: unassigned, silent reads-as-zero) but only **latched** —
+  ch 0-7 SAR/DAR/TCR/CHCR + word-access DMAOR. No transfer engine: board-level
+  cascade engines fetch `sh7750_dmac_sar()` and report completion via
+  `sh7750_dmac_transfer_done()` (advances SAR, TCR=0, CHCR.TE).
+- `hw/sh4/dreamcast.c` `dc-ch2dma` at **0x005f6800**: `SB_C2DSTAT/C2DLEN/C2DST`
+  + `SB_LMMODE0/1` latch. `C2DST=1` copies C2DLEN bytes from DMAC ch2 SAR
+  (cascade/DDT) to the destination, then (GD-ROM-style ~0.1 ms timer) raises
+  **Holly event 19** (ISTNRM bit 19 → IRQ13 = kernel `HW_EVENT_PVR2_DMA`).
+  Dest decode: `0x10000000-0x13ffffff` texture windows → VRAM (no 64/32-bit
+  interleave modelled); anything else masked to a 29-bit bus address — that
+  makes the unfixed pvr2fb's P2 pointers (0xa5xxxxxx) land at VRAM 0x05xxxxxx,
+  faithfully reproducing the real-HW "thin stripe at screen top" symptom.
+
+Found with this: **mainline kernel bug in `arch/sh/drivers/dma/dma-pvr2.c`** —
+`pvr2_dma_interrupt()` sets `xfer_complete = 1` but never calls
+`wake_up(&chan->wait_queue)`, while the TEI-capable channel makes
+`dma_wait_for_completion()` sleep on exactly that queue (`dma-api.c`).  Result:
+first 4 KB page transfers (the stripe), then the writer sleeps in D state
+forever. Fixed in the DC-Linux 7.1.3 tree by passing the channel as the IRQ
+`dev_id` and waking the queue (mirrors `dma_tei()` in `dma-sh.c`); with the fix
+fbdoom renders at full rate through the DMA path (~65k CH2 IRQs / 12 s).
+Upstream patch pending.
+
 ## Status
 
 Working & verified: machine boot, Holly IRQs, serial console, GD-ROM rootfs mount
