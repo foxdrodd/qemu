@@ -1,0 +1,26 @@
+#!/bin/sh
+# Runs late in Buildroot's default rcS sequence (after proc/sysfs/devtmpfs
+# are up). Prints one marker line the host-side harness (mainline_boot_test.py)
+# watches for on the ttySC1 console — no login/getty round-trip needed.
+
+FAIL=0
+
+grep -qE 'Kernel panic|Oops|Unable to handle kernel' /var/log/dmesg 2>/dev/null \
+    && FAIL=1
+dmesg 2>/dev/null | grep -qE 'Kernel panic|Oops|Unable to handle kernel' \
+    && FAIL=1
+
+grep -q ' / ' /proc/mounts || FAIL=1
+grep -q iso9660 /proc/mounts || FAIL=1
+
+echo "=== uname -a ==="
+uname -a
+echo "=== dmesg ==="
+dmesg
+echo "=== end dmesg ==="
+
+if [ "$FAIL" = "0" ]; then
+    echo "CI_RESULT: PASS"
+else
+    echo "CI_RESULT: FAIL"
+fi

@@ -18,6 +18,5 @@ GTAGS
 *.ast_raw
 *.depend_raw
 *.swp
-*.patch
 *.gcov
 vmu.bin

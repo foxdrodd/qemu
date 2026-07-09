@@ -1,6 +1,7 @@
 # Boot Dreamcast Linux with QEMU
 
 Boots the images of [Modern Linux on the Dreamcast](https://github.com/foxdrodd/dreamcast-linux) with qemu.
+And does nightly integration against mainline linux-next, with 2 known or [soon to be upstreamed patches](https://github.com/foxdrodd/qemu/tree/dreamcast/tests/dreamcast).
 
 ## Build
 

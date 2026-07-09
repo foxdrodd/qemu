@@ -1,0 +1,277 @@
+name: Dreamcast boot-regression CI
+
+# Two decoupled cadences, so kernel churn never gates a plain QEMU commit:
+#   - push/pull_request: build qemu-system-sh4 only, boot-test it against the
+#     last nightly-built mainline kernel + busybox rootfs (fast, ~10-15 min).
+#   - nightly schedule: rebuild the kernel (linux-next HEAD) + rootfs fresh,
+#     publish them, then boot-test the current branch's QEMU against them.
+#     On failure, file/update a regression-tracking issue.
+#
+# See tests/dreamcast/{mainline-ci.config,buildroot-ci.config} and
+# tests/dreamcast/mainline_boot_test.py for what's actually being checked.
+# Out of scope here: the dreamcast-linux fork, AICA/VMU/gdb
+# (tests/dreamcast/dc_integration_test.py) — those stay manual/local.
+
+on:
+  #  push:
+  #  branches: [dreamcast]
+  #pull_request:
+  #  branches: [dreamcast]
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+env:
+  BUILDROOT_VERSION: "2026.05"
+  NIGHTLY_TAG: nightly-mainline
+
+jobs:
+  build-qemu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install QEMU build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config libglib2.0-dev \
+            libpixman-1-dev python3 python3-venv ccache
+
+      - name: Cache qemu-system-sh4 binary (this exact commit)
+        # Unlike Buildroot's config, this repo's source changes on basically
+        # every commit under test — a cache *miss* is the expected, common
+        # case here, so ccache (below) does the real work: it still serves
+        # unchanged files from a previous commit's cache via restore-keys,
+        # even when the exact commit can't match. This binary-level cache
+        # only exists for the *identical*-commit case — re-running the same
+        # workflow_dispatch again without a new push — where there's nothing
+        # to rebuild at all.
+        id: qemu-bin-cache
+        uses: actions/cache@v6
+        with:
+          path: build/qemu-system-sh4
+          key: qemu-bin-${{ github.sha }}
+
+      - name: Cache ccache
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sh4-${{ github.sha }}
+          restore-keys: ccache-sh4-
+      - name: Configure
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        run: |
+          # meson's feature options default to auto — on a dev machine with
+          # a full desktop toolchain installed, that silently links in GTK,
+          # X11, VNC, curl+TLS+Kerberos+LDAP, libssh, D-Bus, wayland, and
+          # more (went from ~80 runtime shared-library deps down to ~24
+          # disabling these). None of it does anything for a headless
+          # `-display none` CI boot test, and it's what breaks boot-test's
+          # bare single-file artifact (needs *every* transitive runtime lib
+          # available or the binary won't even start).
+          ./configure --target-list=sh4-softmmu --disable-docs \
+            --enable-slirp --cc="ccache gcc" \
+            -Dgtk=disabled -Dvnc=disabled -Dsdl=disabled -Dsdl_image=disabled \
+            -Dcurses=disabled -Dcurl=disabled -Dlibssh=disabled -Dspice=disabled \
+            -Dspice_protocol=disabled -Dvnc_jpeg=disabled -Dvnc_sasl=disabled \
+            -Dopengl=disabled -Dvirglrenderer=disabled -Dbrlapi=disabled \
+            -Ddbus_display=disabled -Dselinux=disabled -Dcapstone=disabled
+      - name: Build qemu-system-sh4
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        run: ninja -C build qemu-system-sh4
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qemu-system-sh4
+          path: build/qemu-system-sh4
+          retention-days: 7
+
+  kernel-rootfs:
+    # Only the nightly/manual run rebuilds the (linux-next HEAD) kernel and
+    # rootfs; every push reuses the most recent nightly's published build.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      linux-next-sha: ${{ steps.clone.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Buildroot host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libncurses-dev \
+            rsync wget cpio unzip file genisoimage
+
+      - name: Cache Buildroot toolchain + rootfs
+        # Cache the *final products* (the installed toolchain + rootfs.tar),
+        # not build intermediates: Buildroot tracks per-package build
+        # completion via .stamp_* files under output/build/<pkg>/, not by
+        # checking whether the final binaries already exist — a fresh
+        # checkout has no stamps, so restoring output/host alone still
+        # rebuilds everything from scratch (make has no way to know it can
+        # skip). Skipping the make invocation entirely on a hit sidesteps
+        # that completely — no build, no ccache, nothing to recompute.
+        id: buildroot-cache
+        uses: actions/cache@v6
+        with:
+          path: buildroot-out
+          key: buildroot-out-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('tests/dreamcast/buildroot-ci.config', 'tests/dreamcast/rootfs-overlay/**') }}
+
+      - name: Fetch Buildroot ${{ env.BUILDROOT_VERSION }}
+        if: steps.buildroot-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p buildroot
+          wget -q https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.gz
+          tar xf buildroot-${BUILDROOT_VERSION}.tar.gz --strip-components=1 -C buildroot
+
+      - name: Build sh4 toolchain + busybox rootfs
+        if: steps.buildroot-cache.outputs.cache-hit != 'true'
+        run: |
+          cd buildroot
+          make O=output defconfig DEFCONFIG=$GITHUB_WORKSPACE/tests/dreamcast/buildroot-ci.config
+          make O=output BR2_ROOTFS_OVERLAY=$GITHUB_WORKSPACE/tests/dreamcast/rootfs-overlay -j"$(nproc)"
+          mkdir -p $GITHUB_WORKSPACE/buildroot-out
+          cp -a output/host $GITHUB_WORKSPACE/buildroot-out/host
+          cp output/images/rootfs.tar $GITHUB_WORKSPACE/buildroot-out/rootfs.tar
+
+      - name: Package rootfs.iso
+        run: |
+          mkdir -p rootfs
+          tar xf buildroot-out/rootfs.tar -C rootfs
+          # -C 0,11702 matches GDROM_DATA_LBA in hw/sh4/dreamcast.c: the data
+          # track's ISO9660 structures must encode absolute disc LBAs
+          # starting at 11702 (the dreamcast-linux convention), not
+          # file-relative LBAs from 0 — otherwise isofs root-inode reads
+          # land before the data track (reads as zeroed) and mount fails.
+          genisoimage -l -r -C 0,11702 -o rootfs.iso rootfs
+
+      - name: Shallow-clone linux-next
+        id: clone
+        run: |
+          git clone --depth 1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git \
+            linux-next
+          SHA=$(git -C linux-next rev-parse HEAD)
+          echo "LINUX_NEXT_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Apply hotfixes (drop each once upstream)
+        # gdrom_spicommand() used outsw()/insw() (legacy port I/O) on what is
+        # actually an MMIO register; mainline gdrom.c oopses on open against
+        # QEMU's (and real hardware's) GD-ROM. Fix posted upstream
+        # (lore.kernel.org/linux-sh/20260423194132.693271-1-fuchsfl@gmail.com/).
+        # The BBA (rtl8139) fix addresses 8139too failing to probe (-22)
+        # because only one of BAR0(PIO)/BAR1(MMIO) gets a matching-type
+        # host-bridge resource window. Neither is merged yet — each step
+        # becomes a no-op the moment its fix lands.
+        run: |
+          cd linux-next
+                    if grep -q 'writesw((void __iomem \*)GDROM_DATA_REG' drivers/cdrom/gdrom.c; then
+           echo "gdrom: already upstream, skipping"
+          elif git apply $GITHUB_WORKSPACE/tests/dreamcast/hotfix-gdrom.patch; then
+            echo "gdrom: applied"
+          else
+            echo "::error::gdrom hotfix no longer applies cleanly — check if upstream changed drivers/cdrom/gdrom.c"
+            exit 1
+          fi
+          if grep -q 'io_map_base\s*=\s*P2SEG' arch/sh/drivers/pci/pci-dreamcast.c; then
+            echo "bba: already upstream, skipping"
+          elif git apply $GITHUB_WORKSPACE/tests/dreamcast/hotfix-dreamcast-bba.patch; then
+            echo "bba: applied"
+          else
+            echo "::error::bba hotfix no longer applies cleanly — check if upstream changed arch/sh/drivers/pci/{pci,fixups}-dreamcast.c"
+            exit 1
+          fi
+
+      - name: Cross-compile vmlinux
+        run: |
+          TOOLCHAIN="$GITHUB_WORKSPACE/buildroot-out/host/bin"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          export PATH="$TOOLCHAIN:$PATH"
+          CROSS=sh4-buildroot-linux-musl-
+          cd linux-next
+          make ARCH=sh CROSS_COMPILE=$CROSS dreamcast_defconfig
+          scripts/kconfig/merge_config.sh -m -O . .config \
+            $GITHUB_WORKSPACE/tests/dreamcast/mainline-ci.config
+          make ARCH=sh CROSS_COMPILE=$CROSS olddefconfig
+          make ARCH=sh CROSS_COMPILE=$CROSS -j"$(nproc)" vmlinux
+
+      - name: Publish nightly kernel + rootfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$NIGHTLY_TAG" --yes --cleanup-tag || true
+          gh release create "$NIGHTLY_TAG" \
+            --title "Nightly mainline kernel + busybox rootfs" \
+            --notes "linux-next @ ${LINUX_NEXT_SHA}" \
+            --prerelease \
+            linux-next/vmlinux rootfs.iso
+
+  boot-test:
+    needs: [build-qemu, kernel-rootfs]
+    # kernel-rootfs is skipped on push/pull_request (see its `if:`); this
+    # still runs then, consuming the previous nightly's published release.
+    if: always() && needs.build-qemu.result == 'success' && needs.kernel-rootfs.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install QEMU runtime deps
+        # qemu-system-sh4 is dynamically linked (e.g. libslirp for -nic
+        # user); its RUNPATH is $ORIGIN/subprojects/slirp, which only exists
+        # in the full build tree build-qemu compiled it in — here it's just
+        # the bare binary artifact, so the loader falls back to the system
+        # library path. Install every remaining runtime dep explicitly
+        # (ldd qemu-system-sh4) rather than relying on whatever happens to
+        # already be on the runner image — the Configure step already trims
+        # this down from ~80 to ~24 by disabling unused GTK/VNC/curl/etc
+        # features; these are what's left.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libslirp0 libpixman-1-0 libpng16-16t64 libnuma1 libdw1t64 \
+            libusb-1.0-0
+      - uses: actions/download-artifact@v8
+        with:
+          name: qemu-system-sh4
+          path: build
+      - run: chmod +x build/qemu-system-sh4
+      - name: Fetch latest nightly-mainline kernel + rootfs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$NIGHTLY_TAG" -p vmlinux -p rootfs.iso --clobber
+      - name: Run mainline boot-regression test
+        run: |
+          # 300s, not the 120s default: GitHub-hosted runners are slower for
+          # this CPU-bound TCG emulation than a dev workstation — a boot that
+          # takes ~10-15s locally can still be mid-boot at the 120s mark here.
+          python3 tests/dreamcast/mainline_boot_test.py \
+            --qemu build/qemu-system-sh4 --kernel vmlinux --iso rootfs.iso \
+            --kernel-sha "${{ needs.kernel-rootfs.outputs.linux-next-sha }}" \
+            --boot-timeout 300 --tap
+        timeout-minutes: 10
+
+  report-regression:
+    needs: [kernel-rootfs, boot-test]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="Dreamcast boot regression: nightly run failed ($(date -u +%F))"
+          BODY="Nightly mainline-kernel boot-regression CI failed. See the \
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING=$(gh issue list --label regression --state open --json number \
+            --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label regression
+          fi

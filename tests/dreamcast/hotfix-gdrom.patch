@@ -1,0 +1,277 @@
+From 7b9c7fc14559ac322b1b94e07280be6bc5270354 Mon Sep 17 00:00:00 2001
+From: Florian Fuchs <fuchsfl@gmail.com>
+Date: Tue, 12 May 2026 22:16:15 +0200
+Subject: [PATCH v4 0/3] cdrom: gdrom: fix block I/O and capacity setting
+
+Hi all,
+
+This series fixes a gdrom driver Oops due to bad MMIO register access and
+fixes the missing updates of the block layer gendisk capacity that
+prevented ISO9660 mounts from working. It fixes also the case of disc
+swapping by sending the Test Unit command prior to cdrom_open().
+
+The change was tested on real Sega Dreamcast devices (PAL-E, NTSC-J,
+NTSC-U) with physical CD-R discs and with GDEMU emulated discs. Before:
+Oops on mount and an unusable drive. After: Successfully able to mount
+and use the inserted medium.
+
+Thanks,
+Florian
+---
+v3->v4: Simplified condition in "cdrom: gdrom: update gendisk capacity
+	on open" according to review feedback. Sort trailers correctly.
+v2->v3: Added patch "cdrom: gdrom: verify device access after disc swap"
+        from Artur Rojek to also handle the disc swap case reliably. And
+        added Acked-by, Reviewed-by from v2 to the respective patches.
+        Also handle the GDROM case in gdrom_update_capacity().
+v1->v2: for "cdrom: gdrom: replace port I/O with MMIO accessors": Don't
+        use helper functions with io.*_rep(), but writesw() and readsw()
+        local in the respective functions. Improved failure case of
+        gdrom_update_capacity() in gdrom_bdops_open().
+
+v3: https://lore.kernel.org/linux-sh/20260423194132.693271-1-fuchsfl@gmail.com/
+v2: https://lore.kernel.org/linux-sh/20260419162823.2829286-1-fuchsfl@gmail.com/
+v1: https://lore.kernel.org/linux-sh/20260405082330.4104672-1-fuchsfl@gmail.com/
+
+Artur Rojek (1):
+  cdrom: gdrom: verify device access after disc swap
+
+Florian Fuchs (2):
+  cdrom: gdrom: replace port I/O with MMIO accessors
+  cdrom: gdrom: update gendisk capacity on open
+
+ drivers/cdrom/gdrom.c | 61 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 57 insertions(+), 4 deletions(-)
+
+
+base-commit: 6de23f81a5e08be8fbf5e8d7e9febc72a5b5f27f
+-- 
+2.43.0
+
+From c0c5f7d1629e769fb4d2934a5067ba600f517079 Mon Sep 17 00:00:00 2001
+From: Florian Fuchs <fuchsfl@gmail.com>
+Date: Fri, 3 Apr 2026 23:24:55 +0200
+Subject: [PATCH v4 1/3] cdrom: gdrom: replace port I/O with MMIO accessors
+
+GDROM_DATA_REG is a memory-mapped data register, but the driver uses
+outsw() and insw() only for this register. Replace this with MMIO
+accessors readsw() / writesw().
+
+Before, it oopsed accessing the data register, as the io_port_base
+P2SEG gets added to the argument in outsw() / insw(), which leads to an
+unusable drive:
+
+        BUG: unable to handle kernel paging request at 405f7080
+        PC: [<8c28d5b4>] gdrom_spicommand+0x6c/0xb0
+
+Acked-by: Artur Rojek <contact@artur-rojek.eu>
+Reviewed-by: Adrian McMenamin <adrianmcmenamin@gmail.com>
+Signed-off-by: Florian Fuchs <fuchsfl@gmail.com>
+---
+v3->v4: Sort trailers.
+v2->v3: no functional change. Added Acked-by from Artur Rojek.
+        Added Reviewed-by tag from Adrian McMenamin.
+v1->v2: Don't use helper functions with io.*_rep(), but writesw() and
+        readsw() local in the respective functions
+
+v3: https://lore.kernel.org/linux-sh/20260423194132.693271-2-fuchsfl@gmail.com/
+v2: https://lore.kernel.org/linux-sh/20260419162823.2829286-2-fuchsfl@gmail.com/
+v1: https://lore.kernel.org/linux-sh/20260405082330.4104672-2-fuchsfl@gmail.com/
+
+ drivers/cdrom/gdrom.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/cdrom/gdrom.c b/drivers/cdrom/gdrom.c
+index 4ba4dd06cbf4..094d55b2d004 100644
+--- a/drivers/cdrom/gdrom.c
++++ b/drivers/cdrom/gdrom.c
+@@ -198,7 +198,7 @@ static void gdrom_spicommand(void *spi_string, int buflen)
+ 		gdrom_getsense(NULL);
+ 		return;
+ 	}
+-	outsw(GDROM_DATA_REG, cmd, 6);
++	writesw((void __iomem *)GDROM_DATA_REG, cmd, 6);
+ }
+ 
+ 
+@@ -282,7 +282,7 @@ static int gdrom_readtoc_cmd(struct gdromtoc *toc, int session)
+ 		err = -EINVAL;
+ 		goto cleanup_readtoc;
+ 	}
+-	insw(GDROM_DATA_REG, toc, tocsize/2);
++	readsw((void __iomem *)GDROM_DATA_REG, toc, tocsize / 2);
+ 	if (gd.status & 0x01)
+ 		err = -EINVAL;
+ 
+@@ -433,7 +433,7 @@ static int gdrom_getsense(short *bufstring)
+ 		GDROM_DEFAULT_TIMEOUT);
+ 	if (gd.pending)
+ 		goto cleanup_sense;
+-	insw(GDROM_DATA_REG, &sense, sense_command->buflen/2);
++	readsw((void __iomem *)GDROM_DATA_REG, &sense, sense_command->buflen / 2);
+ 	if (sense[1] & 40) {
+ 		pr_info("Drive not ready - command aborted\n");
+ 		goto cleanup_sense;
+@@ -612,7 +612,7 @@ static blk_status_t gdrom_readdisk_dma(struct request *req)
+ 		cpu_relax();
+ 	gd.pending = 1;
+ 	gd.transfer = 1;
+-	outsw(GDROM_DATA_REG, &read_command->cmd, 6);
++	writesw((void __iomem *)GDROM_DATA_REG, read_command->cmd, 6);
+ 	timeout = jiffies + HZ / 2;
+ 	/* Wait for any pending DMA to finish */
+ 	while (__raw_readb(GDROM_DMA_STATUS_REG) &&
+
+base-commit: 6de23f81a5e08be8fbf5e8d7e9febc72a5b5f27f
+-- 
+2.43.0
+
+From 4e56039d4bdbc6b70b37bc32dbda73eef7cbcfcd Mon Sep 17 00:00:00 2001
+From: Florian Fuchs <fuchsfl@gmail.com>
+Date: Sat, 4 Apr 2026 22:16:07 +0200
+Subject: [PATCH v4 2/3] cdrom: gdrom: update gendisk capacity on open
+
+Update the gendisk capacity of the media. Without the capacity, the block
+reads fail before reaching the request queue, which prevented ISO9660
+mounts. Refresh the capacity from the TOC leadout in gdrom_bdops_open()
+so it checks the inserted media.
+
+Acked-by: Artur Rojek <contact@artur-rojek.eu>
+Signed-off-by: Florian Fuchs <fuchsfl@gmail.com>
+---
+v3->v4: Simplify condition in gdrom_update_capacity()
+v2->v3: Also add quirk to handle proprietary GDROMs, using the same
+        mechanic like in gdrom_get_last_session() try session 1 first
+        for GDROM, then session 0 for CDROMs. Dropped Acked-By due to
+        code change.
+v1->v2: no change for gdrom_update_capacity(), but for
+        gdrom_bdops_open(): handle the failure case when
+        gdrom_update_capacity() fails but previous cdrom_open() succeeded,
+        to cleanup the successful cdrom_open() with cdrom_release()
+
+v3: https://lore.kernel.org/linux-sh/20260423194132.693271-3-fuchsfl@gmail.com/
+v2: https://lore.kernel.org/linux-sh/20260419162823.2829286-3-fuchsfl@gmail.com/
+v1: https://lore.kernel.org/linux-sh/20260405082330.4104672-3-fuchsfl@gmail.com/
+
+ drivers/cdrom/gdrom.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/cdrom/gdrom.c b/drivers/cdrom/gdrom.c
+index 094d55b2d004..603429756a34 100644
+--- a/drivers/cdrom/gdrom.c
++++ b/drivers/cdrom/gdrom.c
+@@ -474,6 +474,23 @@ static const struct cdrom_device_ops gdrom_ops = {
+ 				  CDC_RESET | CDC_DRIVE_STATUS | CDC_CD_R,
+ };
+ 
++static int gdrom_update_capacity(void)
++{
++	sector_t cap;
++
++	if (gdrom_drivestatus(gd.cd_info, CDSL_CURRENT) != CDS_DISC_OK) {
++		set_capacity(gd.disk, 0);
++		return -ENOMEDIUM;
++	}
++	if (gdrom_readtoc_cmd(gd.toc, 1) && gdrom_readtoc_cmd(gd.toc, 0)) {
++		set_capacity(gd.disk, 0);
++		return -EINVAL;
++	}
++	cap = (sector_t)get_entry_lba(gd.toc->leadout) * GD_TO_BLK;
++	set_capacity(gd.disk, cap);
++	return 0;
++}
++
+ static int gdrom_bdops_open(struct gendisk *disk, blk_mode_t mode)
+ {
+ 	int ret;
+@@ -482,6 +499,12 @@ static int gdrom_bdops_open(struct gendisk *disk, blk_mode_t mode)
+ 
+ 	mutex_lock(&gdrom_mutex);
+ 	ret = cdrom_open(gd.cd_info, mode);
++	if (ret)
++		goto out;
++	ret = gdrom_update_capacity();
++	if (ret)
++		cdrom_release(gd.cd_info);
++out:
+ 	mutex_unlock(&gdrom_mutex);
+ 	return ret;
+ }
+-- 
+2.43.0
+
+From 551d15f3dbe2c14140d3aef6ac75a89a8b63ac74 Mon Sep 17 00:00:00 2001
+From: Artur Rojek <contact@artur-rojek.eu>
+Date: Sun, 19 Apr 2026 13:08:53 +0200
+Subject: [PATCH v4 3/3] cdrom: gdrom: verify device access after disc swap
+
+To ready the drive for cdrom_open(), this driver sends a spin disc
+command. However, if the cd lid has been opened and the disc de-spinned,
+the very next SPI command will return UNIT_ATTENTION sense error,
+resulting in a failure to mount the disc.
+
+Fix this by sending a dummy TEST_UNIT command, which will catch the
+above error, and allow subsequent commands to execute correctly.
+
+Signed-off-by: Artur Rojek <contact@artur-rojek.eu>
+Signed-off-by: Florian Fuchs <fuchsfl@gmail.com>
+---
+v3->v4: no change
+v3: new patch added from Artur Rojek and also verified that it works.
+
+v3: https://lore.kernel.org/linux-sh/20260423194132.693271-4-fuchsfl@gmail.com/
+
+ drivers/cdrom/gdrom.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/cdrom/gdrom.c b/drivers/cdrom/gdrom.c
+index 603429756a34..0827f4f0344d 100644
+--- a/drivers/cdrom/gdrom.c
++++ b/drivers/cdrom/gdrom.c
+@@ -219,6 +219,33 @@ static char gdrom_execute_diagnostic(void)
+ 	return __raw_readb(GDROM_ERROR_REG);
+ }
+ 
++/*
++ * Test unit command
++ * byte 0 = 0x0
++ *
++ * This command verifies whether device can be accessed.
++ *
++ * -EIO indicates that device is not ready for operation.
++ */
++static int gdrom_test_unit_cmd(void)
++{
++	struct packet_command *test_command;
++
++	test_command = kzalloc_obj(struct packet_command);
++	if (!test_command)
++		return -ENOMEM;
++	test_command->cmd[0] = 0x0;
++	test_command->buflen = 0;
++	gd.pending = 1;
++	gdrom_packetcommand(gd.cd_info, test_command);
++	wait_event_interruptible_timeout(command_queue, gd.pending == 0,
++					 GDROM_DEFAULT_TIMEOUT);
++	gd.pending = 0;
++	kfree(test_command);
++
++	return gd.status & 0x1 ? -EIO : 0;
++}
++
+ /*
+  * Prepare disk command
+  * byte 0 = 0x70
+@@ -353,6 +380,9 @@ static int gdrom_get_last_session(struct cdrom_device_info *cd_info,
+ 
+ static int gdrom_open(struct cdrom_device_info *cd_info, int purpose)
+ {
++	/* Sink pending UNIT_ATTENTION sense error after a disc swap. */
++	(void)gdrom_test_unit_cmd();
++
+ 	/* spin up the disk */
+ 	return gdrom_preparedisk_cmd();
+ }
+-- 
+2.43.0
+
