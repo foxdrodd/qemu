@@ -348,6 +348,36 @@ def scenario_audio(cfg, res):
               lambda: need(peak > 1000, "silent WAV (peak=%d)" % peak))
 
 
+def scenario_gdb(cfg, res):
+    """gdbstub kernel debugging: attach gdb, break in a driver, confirm it hits.
+
+    Proves the debug workbench end to end — the gdbstub is reachable, sh4
+    symbols resolve against vmlinux, and a hardware breakpoint on a live kernel
+    function (the VSYNC-driven maple poll) actually fires while the guest runs.
+    """
+    if not os.path.exists(cfg.kernel):
+        res.add("gdb breakpoint", FAIL, "kernel/symbols missing: %s" % cfg.kernel)
+        return
+    dc = DCBoot(kernel=cfg.kernel, drives=[cfg.iso], symbols=cfg.kernel,
+                qemu=cfg.qemu)
+    try:
+        try:
+            dc.start_gdb(freeze=True)
+        except Exception as e:
+            res.add("gdb: launch with gdbstub", FAIL, str(e))
+            return
+        res.add("gdb: launch paused with gdbstub", PASS)
+
+        def brk():
+            hit, out = dc.gdb_check("maple_vblank_handler",
+                                    timeout=cfg.boot_timeout)
+            need(hit, "breakpoint never hit; gdb said:\n%s" % out[-400:])
+            return True
+        res.check("gdb: hardware breakpoint hits in maple driver", brk)
+    finally:
+        dc.close()
+
+
 # ============================================================================
 def build_config():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -365,6 +395,9 @@ def build_config():
                     help="run the AICA sound test (needs the sound branch)")
     ap.add_argument("--with-lcd", action="store_true",
                     help="run the VMU LCD screendump test")
+    ap.add_argument("--with-gdb", action="store_true",
+                    help="run the gdbstub kernel-debugging test (needs "
+                         "gdb-multiarch)")
     ap.add_argument("--quick", action="store_true",
                     help="only the boot smoke tests (core + self-boot)")
     ap.add_argument("--tap", action="store_true", help="emit TAP13 output")
@@ -394,6 +427,8 @@ def main():
         scenarios.append(scenario_lcd)
     if cfg.with_audio:
         scenarios.append(scenario_audio)
+    if cfg.with_gdb:
+        scenarios.append(scenario_gdb)
 
     for sc in scenarios:
         try:
