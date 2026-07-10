@@ -346,9 +346,9 @@ static NetClientInfo net_la_info = {
     .receive = la_receive,
 };
 
-static void la_reset(DeviceState *dev)
+static void la_reset_hold(Object *obj, ResetType type)
 {
-    DCLanState *s = DC_LANADAPTER(dev);
+    DCLanState *s = DC_LANADAPTER(obj);
 
     memset(s->dlcr, 0, sizeof(s->dlcr));
     s->dlcr[DLCR6] = D6_ENA_DLC;        /* DLC starts held in reset */
@@ -398,9 +398,10 @@ static const Property la_properties[] = {
 static void la_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = la_realize;
-    device_class_set_legacy_reset(dc, la_reset);
+    rc->phases.hold = la_reset_hold;
     dc->vmsd = &vmstate_la;
     device_class_set_props(dc, la_properties);
 }

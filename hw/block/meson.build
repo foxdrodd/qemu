@@ -5,6 +5,7 @@ system_ss.add(files(
 ))
 system_ss.add(when: 'CONFIG_FDC', if_true: files('fdc.c'))
 system_ss.add(when: 'CONFIG_DC_VMU', if_true: files('dreamcast_vmu.c'))
+system_ss.add(when: 'CONFIG_DC_GDROM', if_true: files('dreamcast_gdrom.c'))
 system_ss.add(when: 'CONFIG_FDC_ISA', if_true: files('fdc-isa.c'))
 system_ss.add(when: 'CONFIG_FDC_SYSBUS', if_true: files('fdc-sysbus.c'))
 system_ss.add(when: 'CONFIG_PFLASH_CFI01', if_true: files('pflash_cfi01.c'))

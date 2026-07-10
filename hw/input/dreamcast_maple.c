@@ -373,9 +373,9 @@ static void maple_input_event(HIDState *hid)
     /* State is pulled on the next GETCOND poll; nothing to do here. */
 }
 
-static void maple_reset(DeviceState *dev)
+static void maple_reset_hold(Object *obj, ResetType type)
 {
-    DCMapleState *s = DC_MAPLE(dev);
+    DCMapleState *s = DC_MAPLE(obj);
 
     s->dmaaddr = 0;
     s->enable = 0;
@@ -417,9 +417,10 @@ static const VMStateDescription vmstate_maple = {
 static void maple_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = maple_realize;
-    device_class_set_legacy_reset(dc, maple_reset);
+    rc->phases.hold = maple_reset_hold;
     dc->vmsd = &vmstate_maple;
 }
 

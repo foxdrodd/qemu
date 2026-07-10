@@ -378,11 +378,21 @@ static const VMStateDescription vmstate_vmu = {
     }
 };
 
+static void vmu_reset_hold(Object *obj, ResetType type)
+{
+    DCVmu *v = DC_VMU(obj);
+
+    memset(v->lcd_fb, 0, sizeof(v->lcd_fb));
+    v->redraw = true;               /* repaint the (blank) panel */
+}
+
 static void vmu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = vmu_realize;
+    rc->phases.hold = vmu_reset_hold;
     dc->vmsd = &vmstate_vmu;
     dc->user_creatable = false;
 }

@@ -30,6 +30,7 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pci_device.h"
+#include "migration/vmstate.h"
 #include "net/net.h"
 #include "system/address-spaces.h"
 #include "qemu/module.h"
@@ -219,11 +220,31 @@ static void gaps_realize(DeviceState *dev, Error **errp)
     pci_config_set_device_id(cfg, PCI_DEVICE_SEGA_BBA);
 }
 
+static void gaps_reset_hold(Object *obj, ResetType type)
+{
+    DCGapsState *s = DREAMCAST_GAPS(obj);
+
+    s->ready = false;               /* bridge re-arms its init handshake */
+}
+
+static const VMStateDescription vmstate_dreamcast_gaps = {
+    .name = "dreamcast-gaps",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(ready, DCGapsState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void gaps_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = gaps_realize;
+    rc->phases.hold = gaps_reset_hold;
+    dc->vmsd = &vmstate_dreamcast_gaps;
     dc->user_creatable = false;
 }
 

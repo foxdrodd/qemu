@@ -253,9 +253,9 @@ static const MemoryRegionOps pvr_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static void pvr_reset(DeviceState *dev)
+static void pvr_reset_hold(Object *obj, ResetType type)
 {
-    DCPvrState *s = DC_PVR(dev);
+    DCPvrState *s = DC_PVR(obj);
 
     memset(s->regs, 0, sizeof(s->regs));
     s->last_width = 0;
@@ -307,9 +307,10 @@ static const VMStateDescription vmstate_pvr = {
 static void pvr_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = pvr_realize;
-    device_class_set_legacy_reset(dc, pvr_reset);
+    rc->phases.hold = pvr_reset_hold;
     dc->vmsd = &vmstate_pvr;
 }
 
