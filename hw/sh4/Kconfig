@@ -13,6 +13,16 @@ config R2D
     select SH7750
     select SH_PCI
 
+config J2
+    bool
+    default y
+    depends on SH4
+    select XILINX          # Xilinx UARTLite (ttyUL0 console)
+    select UNIMP
+    select DEVICE_TREE     # load_device_tree() for the mainline DT kernel (-dtb)
+    select SSI             # jcore SPI master's SSI bus
+    select SSI_SD          # SD card over SPI (mmc_spi)
+
 config SH7750
     bool
     select SH_INTC

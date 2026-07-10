@@ -32,6 +32,7 @@
 #define SH_CPU_SH7751  (1 << 3)
 #define SH_CPU_SH7751R (1 << 4)
 #define SH_CPU_SH7785  (1 << 5)
+#define SH_CPU_J2      (1 << 6)
 #define SH_CPU_SH7750_ALL (SH_CPU_SH7750 | SH_CPU_SH7750S | SH_CPU_SH7750R)
 #define SH_CPU_SH7751_ALL (SH_CPU_SH7751 | SH_CPU_SH7751R)
 
@@ -129,6 +130,12 @@ typedef struct tlb_t {
 enum sh_features {
     SH_FEATURE_SH4A = 1,
     SH_FEATURE_BCR3_AND_BCR4 = 2,
+    /*
+     * J2 (J-Core) is an open-source SH-2 compatible core: no MMU (flat 32-bit
+     * physical addressing), no FPU, adds the atomic cas.l instruction, and uses
+     * the classic SH-2 stack-frame exception model rather than the SH-4 one.
+     */
+    SH_FEATURE_J2 = 4,
 };
 
 typedef struct memory_content {
@@ -184,6 +191,10 @@ typedef struct CPUArchState {
     uint32_t expevt;            /* exception event register */
     uint32_t intevt;            /* interrupt event register */
 
+    /* J2/SH-2 interrupt handoff: vector + priority latched by the board AIC */
+    uint32_t irq_vector;        /* pending interrupt vector (VBR table index) */
+    uint32_t irq_level;         /* pending interrupt priority (compared to IMASK) */
+
     tlb_t itlb[ITLB_SIZE];      /* instruction translation table */
     tlb_t utlb[UTLB_SIZE];      /* unified translation table */
 
@@ -201,6 +212,15 @@ typedef struct CPUArchState {
     uint32_t features;
 
     void *intc_handle;
+
+    /*
+     * J2/SH-2: board interrupt-controller EOI hook. Called after an interrupt
+     * is delivered so the controller can clear the (edge) source it raised.
+     * Set once by the board; must survive CPU reset, hence placed here.
+     */
+    void (*irq_ack)(void *opaque, int vector);
+    void *irq_ack_opaque;
+
     int in_sleep;               /* SR_BL ignored during sleep */
     memory_content *movcal_backup;
     memory_content **movcal_backup_tail;

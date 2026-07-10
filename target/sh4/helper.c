@@ -25,6 +25,7 @@
 #include "exec/target_page.h"
 #include "exec/log.h"
 #include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "qemu/plugin.h"
 
 #if !defined(CONFIG_USER_ONLY)
@@ -68,6 +69,85 @@ void superh_cpu_do_interrupt(CPUState *cs)
 
     do_exp = cs->exception_index != -1;
     do_irq = do_irq && (cs->exception_index == -1);
+
+    if (env->features & SH_FEATURE_J2) {
+        /*
+         * J2/SH-2 exception model: no SSR/SPC/INTEVT banking. The CPU pushes SR
+         * then PC onto the stack (R15), then vectors through the in-memory table
+         * at VBR (which holds a handler *address* per vector). Interrupts also
+         * raise SR.IMASK to the accepted priority. There is no SR.BL.
+         */
+        uint32_t vec, sp, sr, ret_pc;
+
+        if (do_exp) {
+            switch (cs->exception_index) {
+            case 0x160: /* trapa #imm -> vector imm (syscalls) */
+                vec = env->tra >> 2;
+                break;
+            case 0x1a0: /* slot illegal instruction */
+                vec = 6;
+                break;
+            case 0x0e0: /* CPU address error (read) */
+            case 0x100: /* CPU address error (write) */
+                vec = 9;
+                break;
+            case 0x180: /* general illegal instruction */
+            default:
+                vec = 4;
+                break;
+            }
+        } else if (do_irq) {
+            /* Accepted only when the pending level exceeds SR.IMASK. */
+            if (env->irq_level <= ((env->sr >> 4) & 0xf)) {
+                return; /* masked; stays pending */
+            }
+            vec = env->irq_vector;
+        } else {
+            return;
+        }
+
+        /* A branch that faulted in its delay slot must be re-executed. */
+        if (env->flags & TB_FLAG_DELAY_SLOT_MASK) {
+            env->pc -= 2;
+            env->flags &= ~TB_FLAG_DELAY_SLOT_MASK;
+        }
+
+        ret_pc = env->pc;
+        if (do_exp && cs->exception_index == 0x160) {
+            ret_pc += 2; /* TRAPA returns past the trapa instruction */
+        }
+
+        sr = cpu_read_sr(env);
+        sp = env->gregs[15];
+        sp -= 4;
+        cpu_stl_data(env, sp, sr);      /* push SR */
+        sp -= 4;
+        cpu_stl_data(env, sp, ret_pc);  /* push return PC */
+        env->gregs[15] = sp;
+        env->lock_addr = -1;
+
+        if (do_irq) {
+            env->sr = (env->sr & ~(0xf << 4)) | ((env->irq_level & 0xf) << 4);
+            env->intevt = vec;
+            if (env->irq_ack) {
+                env->irq_ack(env->irq_ack_opaque, vec);
+            }
+            qemu_plugin_vcpu_interrupt_cb(cs, last_pc);
+        } else {
+            env->expevt = cs->exception_index;
+            qemu_plugin_vcpu_exception_cb(cs, last_pc);
+        }
+
+        env->pc = cpu_ldl_data(env, env->vbr + vec * 4);
+        if (qemu_loglevel_mask(CPU_LOG_INT)) {
+            qemu_log("j2 %s vec=%d (exc=0x%03x) pc=0x%08x->0x%08x "
+                     "sr=0x%08x sp=0x%08x vbr=0x%08x\n",
+                     do_irq ? "irq" : "exc", vec, cs->exception_index,
+                     (uint32_t)last_pc, env->pc, cpu_read_sr(env),
+                     env->gregs[15], env->vbr);
+        }
+        return;
+    }
 
     if (env->sr & (1u << SR_BL)) {
         if (do_exp && cs->exception_index != 0x1e0) {
@@ -401,6 +481,17 @@ static int get_physical_address(CPUSH4State *env, hwaddr* physical,
                                 int *prot, vaddr address,
                                 MMUAccessType access_type)
 {
+    /*
+     * J2/SH-2 has no MMU and no SH-4 P0-P4 segmentation: the whole 32-bit
+     * address space maps 1:1 to physical (peripherals live at 0xabcd0000, well
+     * outside the SH-4 29-bit window, so no masking).
+     */
+    if (env->features & SH_FEATURE_J2) {
+        *physical = address;
+        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+        return MMU_OK;
+    }
+
     /* P1, P2 and P4 areas do not use translation */
     if ((address >= 0x80000000 && address < 0xc0000000) || address >= 0xe0000000) {
         if (!(env->sr & (1u << SR_MD))

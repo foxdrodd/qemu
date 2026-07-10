@@ -55,6 +55,11 @@ static TCGTBCPUState superh_get_tb_cpu_state(CPUState *cs)
 #ifdef CONFIG_USER_ONLY
     flags |= TB_FLAG_UNALIGN * !cs->prctl_unalign_sigbus;
 #endif
+    /* J2/J-core supports unaligned memory access in hardware (unlike plain
+     * SH-2/SH-4, which fault). Never raise an address-error for J2. */
+    if (env->features & SH_FEATURE_J2) {
+        flags |= TB_FLAG_UNALIGN;
+    }
 
     return (TCGTBCPUState){
         .pc = env->pc,
@@ -144,8 +149,19 @@ static void superh_cpu_reset_hold(Object *obj, ResetType type)
     env->fpscr = FPSCR_PR; /* value for userspace according to the kernel */
     set_float_rounding_mode(float_round_nearest_even, &env->fp_status); /* ?! */
 #else
-    env->sr = (1u << SR_MD) | (1u << SR_RB) | (1u << SR_BL) |
-              (1u << SR_I3) | (1u << SR_I2) | (1u << SR_I1) | (1u << SR_I0);
+    if (env->features & SH_FEATURE_J2) {
+        /*
+         * SH-2/J2 reset: flat physical addressing, all code privileged (MD=1,
+         * no user mode on SH-2), no register banking (RB=0), no BL, and all
+         * interrupts masked (IMASK=15). The board reset hook overrides PC.
+         */
+        env->pc = 0;
+        env->sr = (1u << SR_MD) |
+                  (1u << SR_I3) | (1u << SR_I2) | (1u << SR_I1) | (1u << SR_I0);
+    } else {
+        env->sr = (1u << SR_MD) | (1u << SR_RB) | (1u << SR_BL) |
+                  (1u << SR_I3) | (1u << SR_I2) | (1u << SR_I1) | (1u << SR_I0);
+    }
     env->fpscr = FPSCR_DN | FPSCR_RM_ZERO; /* CPU reset value according to SH4 manual */
     set_float_rounding_mode(float_round_to_zero, &env->fp_status);
     set_flush_to_zero(1, &env->fp_status);
@@ -242,6 +258,24 @@ static void sh7785_class_init(ObjectClass *oc, const void *data)
     scc->pvr = 0x10300700;
     scc->prr = 0x00000200;
     scc->cvr = 0x71440211;
+}
+
+static void j2_cpu_initfn(Object *obj)
+{
+    CPUSH4State *env = cpu_env(CPU(obj));
+
+    env->id = SH_CPU_J2;
+    env->features = SH_FEATURE_J2;
+}
+
+static void j2_class_init(ObjectClass *oc, const void *data)
+{
+    SuperHCPUClass *scc = SUPERH_CPU_CLASS(oc);
+
+    /* J2 has no SH-4 style version registers; report zero. */
+    scc->pvr = 0x00000000;
+    scc->prr = 0x00000000;
+    scc->cvr = 0x00000000;
 }
 
 static void superh_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -359,6 +393,8 @@ static const TypeInfo superh_cpu_type_infos[] = {
                            sh7751r_cpu_initfn),
     DEFINE_SUPERH_CPU_TYPE(TYPE_SH7785_CPU, sh7785_class_init,
                            sh7785_cpu_initfn),
+    DEFINE_SUPERH_CPU_TYPE(TYPE_J2_CPU, j2_class_init,
+                           j2_cpu_initfn),
 
 };
 

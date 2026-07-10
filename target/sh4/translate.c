@@ -53,8 +53,15 @@ typedef struct DisasContext {
 #define IS_USER(ctx) 1
 #define UNALIGN(C)   (ctx->tbflags & TB_FLAG_UNALIGN ? MO_UNALN : MO_ALIGN)
 #else
-#define IS_USER(ctx) (!(ctx->tbflags & (1u << SR_MD)))
-#define UNALIGN(C)   MO_ALIGN
+/*
+ * SH-2/J2 has no user mode and no SR.MD bit, so all code is privileged. Its SR
+ * values never set MD, which would otherwise make every privileged instruction
+ * (stc/ldc sr, ...) fault as illegal.
+ */
+#define IS_USER(ctx) \
+    (!(ctx->features & SH_FEATURE_J2) && !(ctx->tbflags & (1u << SR_MD)))
+/* J2/J-core does unaligned access in hardware; TB_FLAG_UNALIGN is set for it. */
+#define UNALIGN(C)   (ctx->tbflags & TB_FLAG_UNALIGN ? MO_UNALN : MO_ALIGN)
 #endif
 
 /* Target-specific values for ctx->base.is_jmp.  */
@@ -382,6 +389,11 @@ static inline void gen_store_fpr64(DisasContext *ctx, TCGv_i64 t, int reg)
         goto do_illegal;                      \
     }
 
+#define CHECK_J2 \
+    if (!(ctx->features & SH_FEATURE_J2)) { \
+        goto do_illegal;                    \
+    }
+
 static void _decode_opc(DisasContext * ctx)
 {
     /* This code tries to make movcal emulation sufficiently
@@ -448,8 +460,26 @@ static void _decode_opc(DisasContext * ctx)
     case 0x002b: /* rte */
         CHECK_PRIVILEGED
         CHECK_NOT_DELAY_SLOT
-        gen_write_sr(cpu_ssr);
-        tcg_gen_mov_i32(cpu_delayed_pc, cpu_spc);
+        if (ctx->features & SH_FEATURE_J2) {
+            /*
+             * SH-2/J2 has no SSR/SPC: the exception frame lives on the stack.
+             * rte pops PC (pushed last, on top) then SR off R15.
+             */
+            TCGv new_pc = tcg_temp_new();
+            TCGv new_sr = tcg_temp_new();
+            TCGv addr = tcg_temp_new();
+
+            tcg_gen_qemu_ld_i32(new_pc, REG(15), ctx->memidx,
+                                MO_TESL | MO_ALIGN);
+            tcg_gen_addi_i32(addr, REG(15), 4);
+            tcg_gen_qemu_ld_i32(new_sr, addr, ctx->memidx, MO_TESL | MO_ALIGN);
+            tcg_gen_addi_i32(REG(15), REG(15), 8);
+            gen_write_sr(new_sr);
+            tcg_gen_mov_i32(cpu_delayed_pc, new_pc);
+        } else {
+            gen_write_sr(cpu_ssr);
+            tcg_gen_mov_i32(cpu_delayed_pc, cpu_spc);
+        }
         ctx->envflags |= TB_FLAG_DELAY_SLOT_RTE;
         ctx->delayed_pc = (uint32_t) - 1;
         ctx->base.is_jmp = DISAS_STOP;
@@ -563,6 +593,23 @@ static void _decode_opc(DisasContext * ctx)
     case 0x2002: /* mov.l Rm,@Rn */
         tcg_gen_qemu_st_i32(REG(B7_4), REG(B11_8), ctx->memidx,
                             MO_TEUL | UNALIGN(ctx));
+        return;
+    case 0x2003: /* cas.l Rm,Rn,@R0 (J2 atomic compare-and-swap) */
+        /*
+         * Per the kernel's inline asm ("cas.l %1,%0,@r0" with %1=old, %0=new):
+         *   old = (R0);  if (old == Rm) (R0) = Rn, T = 1; else T = 0;  Rn = old
+         * i.e. Rm (bits 7:4) is the compare value, Rn (bits 11:8) is the new
+         * value and receives the original memory word. This is the only ISA
+         * addition the J-Core J2 makes over plain SH-2.
+         */
+        CHECK_J2
+        {
+            TCGv old = tcg_temp_new();
+            tcg_gen_atomic_cmpxchg_i32(old, REG(0), REG(B7_4), REG(B11_8),
+                                       ctx->memidx, MO_TEUL | MO_ALIGN);
+            tcg_gen_setcond_i32(TCG_COND_EQ, cpu_sr_t, old, REG(B7_4));
+            tcg_gen_mov_i32(REG(B11_8), old);
+        }
         return;
     case 0x6000: /* mov.b @Rm,Rn */
         tcg_gen_qemu_ld_i32(REG(B11_8), REG(B7_4), ctx->memidx, MO_SB);
