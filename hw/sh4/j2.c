@@ -471,7 +471,13 @@ static void j2_init(MachineState *machine)
     if (machine->dtb) {
         int dtb_size;
         void *dtb = load_device_tree(machine->dtb, &dtb_size);
-        hwaddr dtb_addr = SDRAM_BASE + 0x00800000;   /* 8 MB in, clear of kernel */
+        /*
+         * 32 MB in: clear of the kernel image *including* any built-in
+         * initramfs (the SMP kernel's ~1.7 MB CONFIG_INITRAMFS_SOURCE pushes
+         * the ELF end to ~8.2 MB, past the old 8 MB spot), and still inside the
+         * DTS 64 MB memory node so early_init_fdt_reserve_self reserves it.
+         */
+        hwaddr dtb_addr = SDRAM_BASE + 0x02000000;
 
         if (!dtb) {
             error_report("Could not load device tree '%s'", machine->dtb);

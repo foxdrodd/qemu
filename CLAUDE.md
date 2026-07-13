@@ -56,8 +56,13 @@ SD card). Direct invocation essentials:
 - Kernel: `-kernel <vmlinux>` (big-endian SH ELF, load `0x10000000`-ish, entry from
   the ELF). Two kernels boot off the same register layout:
   - **mainline 7.2 device-tree kernel** (`jcore,j2-soc`): pass `-dtb <j2.dtb>`; the
-    DTB is loaded into RAM and its phys addr handed to the kernel in **r4**
-    (`mach-jcore head_32.S`). Boots to an interactive shell. **This is the current one.**
+    DTB is loaded into RAM at **`0x12000000`** (32 MB in) and its phys addr handed to
+    the kernel in **r4** (`mach-jcore head_32.S`). Boots to an interactive shell.
+    **This is the current one.** (The DTB address was `0x10800000` / 8 MB in; a kernel
+    with a large `CONFIG_INITRAMFS_SOURCE` built in — e.g. the SMP kernel, ELF end
+    ~8.2 MB — overlaps that, so `j2.c` now stages it at 32 MB, still inside the DTS
+    64 MB memory node so `early_init_fdt_reserve_self` reserves it. QEMU aborts with
+    "Some ROM regions are overlapping" if the DTB lands inside the kernel image.)
   - the pre-DT 4.3.0 board-file kernel: no `-dtb`, uses static platform devices.
 - SD card: `-drive if=sd,file=<img>,format=raw` → **`/dev/mmcblk0`** via mainline
   `mmc_spi`. **Requires the SD-node DTB** (`j2_mimas_v2_sd.dtb`, which has
@@ -69,7 +74,7 @@ Build a DTB from the kernel DTS:
 
 ## Memory map (identity — J2 has no MMU/segmentation)
 
-SDRAM `0x10000000` (128 MB) · DTB blob `0x10800000` · SoC base `0xabcd0000`:
+SDRAM `0x10000000` (128 MB) · DTB blob `0x12000000` (32 MB in) · SoC base `0xabcd0000`:
 GPIO `+0x000` (unimpl) · **SPI+SD `+0x040`** · cache `+0x0c0` (unimpl) · UART0/console
 `+0x100` (vec 18) · AIC+PIT `+0x200` · UART1 `+0x300` (vec 23) · UART2 `+0x400`
 (vec 19) · cpuid `+0x600` (unimpl).
@@ -136,10 +141,15 @@ Notes:
 
 ## Known non-QEMU bugs found via this machine (diagnosed, not our bugs)
 
-- **New-kernel `sched_init_domains` hang** = an SH/toolchain SMP-topology
-  miscompile: `find_next_bit` did a second `__ffs(0)` unconditionally (zero-guard
-  scheduled after the bit-scan) → infinite loop. Would hang on the FPGA too. **Worked
-  around by building the kernel with `CONFIG_SMP=n`.**
+- **New-kernel `sched_init_domains` hang** = a **GCC 9.4** SH SMP-topology codegen
+  bug: `find_next_bit` did a second `__ffs(0)` unconditionally (zero-guard scheduled
+  after the bit-scan) → infinite loop. Would hang on the FPGA too. Originally worked
+  around with `CONFIG_SMP=n`. **FIXED (verified 2026-07-13): build with GCC 17**
+  (`/media/flo/nvme0-ssd/musl-cross-make-gcc17/output/bin/sh2eb-linux-muslfdpic-gcc`,
+  17.0.0; the old `.../musl-cross-make/` is 9.4.0). A `CONFIG_SMP=y NR_CPUS=2` kernel
+  built with gcc17 now boots clean past `sched_init_domains` to an interactive shell
+  (`smp: Brought up 1 node, 1 CPU`; only 1 core onlines because the Mimas DTS has no
+  `cpu@1` — `CPU enable method: (null)`). So `CONFIG_SMP=n` is **no longer required**.
 - **Old-kernel userspace `sed` hang**: toybox `sed` applies a stale `regmatch`
   offset from a prior matching line to a later non-matching line → `memcpy` with an
   underflowed (negative → ~4 GB) length. A toybox/regex issue, not CPU emulation (all
