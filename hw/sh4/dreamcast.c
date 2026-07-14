@@ -57,6 +57,7 @@
 #define HOLLY_INTC_BASE 0x005f6900       /* Holly ASIC interrupt regs (ESR/EMR) */
 #define CH2DMA_BASE     0x005f6800       /* Holly CH2 ("PVR") DMA registers */
 #define PVR_BASE        0x005f8000       /* PowerVR2 display registers */
+#define TA_FIFO_BASE    0x10000000       /* PowerVR2 tile-accelerator input FIFO */
 
 /* CONFIG_BOOT_LINK_OFFSET of the Dreamcast Linux kernel. */
 #define LINUX_LOAD_OFFSET  0x00800000
@@ -248,6 +249,7 @@ static void dreamcast_init(MachineState *machine)
     ResetData *reset_info;
     struct SH7750State *s;
     DeviceState *holly;
+    DeviceState *ta;
     DeviceState *gd;
     DriveInfo *dinfo;
     MemoryRegion *address_space_mem = get_system_memory();
@@ -312,8 +314,17 @@ static void dreamcast_init(MachineState *machine)
         dc_gaps_init(qdev_get_gpio_in(holly, HOLLY_EV_EXTERNAL));
     }
 
+    /*
+     * PowerVR2 Tile Accelerator: parses the parameter FIFO at 0x10000000 and
+     * rasterises the binned lists into VRAM on STARTRENDER, raising "end of
+     * render (TSP)" (Holly event 2).  The display forwards TA_LIST_INIT and
+     * STARTRENDER register writes to it.
+     */
+    ta = dc_ta_init(TA_FIFO_BASE, vram,
+                    qdev_get_gpio_in(holly, HOLLY_EV_PVR_RENDER));
+
     /* PowerVR2 display: scans out VRAM and raises VSYNC (Holly event 5). */
-    dc_pvr_init(PVR_BASE, vram, qdev_get_gpio_in(holly, HOLLY_EV_VSYNC));
+    dc_pvr_init(PVR_BASE, vram, qdev_get_gpio_in(holly, HOLLY_EV_VSYNC), ta);
 
     /*
      * Maple bus: keyboard (port 0), mouse (port 1), DMA-complete IRQ via Holly

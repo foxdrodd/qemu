@@ -93,8 +93,15 @@ static void dc_ch2dma_kick(DCCh2DmaState *s)
      * (+0x400000).  LMMODE = 1 is a linear 1:1 mapping.
      */
     if ((dst & 0x1c000000) == 0x10000000) {
-        off = dst & 0x00ffffff;
-        lm  = (dst & 0x02000000) ? s->lmmode1 : s->lmmode0;
+        if (dst & 0x01000000) {
+            /* 0x11xxxxxx / 0x13xxxxxx: texture upload into VRAM. */
+            off = dst & 0x00ffffff;
+            lm  = (dst & 0x02000000) ? s->lmmode1 : s->lmmode0;
+        } else {
+            /* 0x10xxxxxx: TA polygon input FIFO - a plain bus write to the
+             * dc-ta-fifo MMIO region parses the parameter stream. */
+            lm = -1;
+        }
     } else {
         uint32_t bus = dst & 0x1fffffe0;
 

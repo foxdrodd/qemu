@@ -38,6 +38,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCPvrState, DC_PVR)
 #define DISP_DIWADDRS   0x54    /* framebuffer start (short field / odd)   */
 #define DISP_DIWSIZE    0x5c    /* modulo<<20 | (rows-1)<<10 | (words-1)   */
 
+/* Tile-accelerator / render-path registers (same 0x005f8000 block). */
+#define PVR_STARTRENDER   0x014 /* write: kick ISP/TSP over the binned lists */
+#define PVR_FB_W_CTRL     0x048 /* render-target pixel format (bits 2-0)     */
+#define PVR_FB_W_LINESTR  0x04c /* render-target line stride (64-bit units)  */
+#define PVR_FB_W_SOF1     0x060 /* render-target base address in VRAM        */
+#define PVR_FB_X_CLIP     0x068 /* render width:  max<<16 | min              */
+#define PVR_FB_Y_CLIP     0x06c /* render height: max<<16 | min              */
+#define PVR_TA_LIST_INIT  0x144 /* write bit31: reset the TA parameter parser */
+
 /*
  * The bytes-per-pixel lives in DIWMODE bits 2-3 (value = bpp-1), written by
  * pvr2_init_display().  Register 0x108 is NOT a reliable pixel-depth source:
@@ -64,6 +73,7 @@ struct DCPvrState {
     QemuConsole *con;
     qemu_irq vblank_irq;        /* Holly VSYNC event (drives Maple polling) */
     QEMUTimer *vblank_timer;
+    DeviceState *ta;            /* Tile Accelerator (dreamcast_ta.c)        */
 
     uint32_t regs[PVR_NR_REGS];
 
@@ -239,6 +249,23 @@ static void pvr_write(void *opaque, hwaddr addr, uint64_t val,
         case DISP_DIWSIZE:
             s->invalidate = true;
             break;
+
+        /* Tile-accelerator triggers, forwarded to dreamcast_ta.c. */
+        case PVR_TA_LIST_INIT:
+            if (s->ta && (val & 0x80000000)) {
+                dc_ta_list_init(s->ta);
+            }
+            break;
+        case PVR_STARTRENDER:
+            if (s->ta) {
+                dc_ta_start_render(s->ta,
+                                   s->regs[PVR_FB_W_SOF1 / 4],
+                                   s->regs[PVR_FB_W_CTRL / 4],
+                                   s->regs[PVR_FB_W_LINESTR / 4],
+                                   s->regs[PVR_FB_X_CLIP / 4],
+                                   s->regs[PVR_FB_Y_CLIP / 4]);
+            }
+            break;
         }
     }
 }
@@ -328,14 +355,17 @@ static void pvr_register_types(void)
 
 type_init(pvr_register_types)
 
-/* Board helper: create the PVR2 display, connect VRAM, map regs, wire VSYNC. */
-void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq)
+/* Board helper: create the PVR2 display, connect VRAM, map regs, wire VSYNC.
+ * The Tile Accelerator (ta) receives forwarded TA_LIST_INIT / STARTRENDER. */
+void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq,
+                 DeviceState *ta)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
 
     dev = qdev_new(TYPE_DC_PVR);
     DC_PVR(dev)->vram = vram;
+    DC_PVR(dev)->ta = ta;
     sbd = SYS_BUS_DEVICE(dev);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, base);

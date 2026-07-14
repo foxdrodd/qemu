@@ -14,7 +14,8 @@ bare-metal test blob live **outside** this tree in the harness project:
 | File | Role |
 |------|------|
 | `hw/sh4/dreamcast.c` | Machine (`DEFINE_MACHINE`), memory map, ELF/initrd loader, **inline** Holly ASIC (interrupt controller) + **inline** GD-ROM drive. Inlining Holly/GD-ROM is a prototyping shortcut, not idiomatic QEMU — split into QOM devices when hardening. |
-| `hw/display/dreamcast_pvr.c` | PowerVR2 (`dc-pvr`): framebuffer **scanout only** (no 3D/TA — Linux doesn't use it) + 60 Hz VSYNC IRQ. |
+| `hw/display/dreamcast_pvr.c` | PowerVR2 (`dc-pvr`): framebuffer scanout + 60 Hz VSYNC IRQ; forwards `TA_LIST_INIT`/`STARTRENDER` register writes to the tile accelerator. |
+| `hw/display/dreamcast_ta.c` | PowerVR2 tile accelerator (`dc-ta`): software TBDR. Parses the real TA parameter stream (FIFO at `0x10000000`) into triangle lists and rasterises opaque/punch/translucent into VRAM on STARTRENDER (per-pixel Z, Gouraud, textured 1555/565/4444 twiddled+linear, bilinear, blend), then raises "end of render" (Holly event 2). Pragmatic: no bit-exact OPB binning; textures fetched linearly. |
 | `hw/input/dreamcast_maple.c` | Maple bus (`dc-maple`): keyboard on port 0 + mouse on port 1, both via QEMU `HIDState`. |
 | `hw/net/dreamcast_la.c` | Sega LAN Adapter (`dc-lanadapter`), Fujitsu MB86967 10 Mbit NIC. |
 | `hw/sh4/sh7750.c` | SH7750/SH7091 SoC. Added `sh7750_set_porta()` + PCTRA/PDTRA read cases. |
@@ -413,6 +414,10 @@ boot descrambles `1ST_READ.BIN` and runs it — musl & uclibc CDIs boot to shell
 **mainline boot-regression CI** (`.github/workflows/dreamcast-boot-ci.yml`,
 first real green end-to-end run 2026-07-09: `build-qemu` + `kernel-rootfs`
 (linux-next + Buildroot) + `boot-test` all `success`).
-Not done: AICA sound; PVR 3D/TA (not needed); VMU RTC sub-function; CI
+PVR 3D/TA: software renderer implemented (`dc-ta`, 2026-07-14) for the Dreamcast Linux
+hardware-accel project; verified with a Gouraud triangle fed via a `/dev/mem` `-initrd`
+test. New Holly event 2 (`HOLLY_EV_PVR_RENDER`, end-of-render TSP). Route change in
+`dreamcast_ch2dma.c`: `0x10xxxxxx`→TA FIFO, `0x11/0x13`→VRAM texture uploads.
+Not done: AICA sound; TA modifier volumes / sprites / palette+VQ+YUV textures; VMU RTC sub-function; CI
 `push`/`pull_request` triggers still disabled (only `workflow_dispatch` +
 nightly `schedule` enabled — see "Mainline boot-regression CI" above).

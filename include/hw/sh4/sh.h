@@ -53,6 +53,7 @@ void sh7750_dmac_transfer_done(struct SH7750State *s, unsigned channel,
  * Hardware-event line numbers used by on-board peripherals (Linux
  * arch/sh/boards/mach-dreamcast/irq.c): the bit within ISTNRM/ISTEXT. */
 enum {
+    HOLLY_EV_PVR_RENDER = 2,  /* ISTNRM bit  2 -> IRQ13 (end of render TSP) */
     HOLLY_EV_VSYNC     = 5,   /* ISTNRM bit  5 -> IRQ13 (video vblank)      */
     HOLLY_EV_MAPLE_DMA = 12,  /* ISTNRM bit 12 -> IRQ13                     */
     HOLLY_EV_GDROM_DMA = 14,  /* ISTNRM bit 14 -> IRQ13                     */
@@ -81,7 +82,17 @@ void dc_lanadapter_init(hwaddr base, qemu_irq irq);
 void dc_gaps_init(qemu_irq irq);
 
 /* hw/display/dreamcast_pvr.c */
-void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq);
+void dc_pvr_init(hwaddr base, MemoryRegion *vram, qemu_irq vblank_irq,
+                 DeviceState *ta);
+
+/* hw/display/dreamcast_ta.c - PowerVR2 Tile Accelerator + ISP/TSP renderer.
+ * The PVR register block (dreamcast_pvr.c) forwards TA_LIST_INIT / STARTRENDER
+ * to these; the input FIFO at 0x10000000 is fed by store-queue/CH2-DMA writes. */
+DeviceState *dc_ta_init(hwaddr fifo_base, MemoryRegion *vram,
+                        qemu_irq render_irq);
+void dc_ta_list_init(DeviceState *ta);
+void dc_ta_start_render(DeviceState *ta, uint32_t fb_base, uint32_t fb_ctrl,
+                        uint32_t linestride, uint32_t xclip, uint32_t yclip);
 
 /* hw/block/dreamcast_vmu.c */
 typedef struct DCVmu DCVmu;
