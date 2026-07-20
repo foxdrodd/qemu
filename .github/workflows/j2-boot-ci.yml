@@ -1,0 +1,291 @@
+name: J2 boot-regression CI
+
+# Continuously boot-tests a J-Core J2 (SH-2, no-MMU, FDPIC/musl) integration
+# image against linux-next. Modeled on the sibling Dreamcast boot-CI, but the
+# GCC-17 cross-toolchain is a ~1h trunk build, so it is a pinned, content-
+# addressed job cached + published on its own (nightlies just download it).
+#
+# Two cadences (like Dreamcast):
+#   - nightly/dispatch: build toolchain (cache) -> rootfs + linux-next vmlinux
+#     -> publish nightly-j2 Release -> boot-test -> report on failure.
+#   - push/PR (commented): build qemu only, boot-test against last nightly.
+#
+# NOTE: this repo is shared with the Dreamcast CI (branch `dreamcast`); Releases
+# and issue labels are repo-global, so every id here is namespaced -j2/-sh2eb.
+
+on:
+  # push:            { branches: [j2] }        # fast path (ready; uncomment to enable)
+  # pull_request:    { branches: [j2] }
+#  schedule:
+#    - cron: "0 22 * * *"                       # nightly 22:00 UTC (offset from Dreamcast's 21:00)
+  workflow_dispatch:
+    inputs:
+      force_toolchain:
+        description: rebuild the toolchain even on a cache hit
+        type: boolean
+        default: false
+
+env:
+  # The -M j2 machine (hw/sh4/j2.c) and tests/j2/ live ONLY on this branch, but
+  # `on: schedule` runs from the repo default branch — so every checkout below
+  # forces this ref, or a nightly would build a QEMU without -M j2.
+  J2_BRANCH: j2
+  GCC_VER: "17.0.0"
+  NIGHTLY_TAG: nightly-j2
+  TOOLCHAIN_TAG: toolchain-sh2eb-gcc17
+  REGRESSION_LABEL: regression-j2
+
+jobs:
+  build-toolchain:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.J2_BRANCH }}
+      - name: Pin values
+        id: pin
+        run: echo "gcc_ref=$(cat tests/j2/toolchain/gcc.gitref)" >> "$GITHUB_OUTPUT"
+      - name: Install toolchain build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison texinfo libgmp-dev libmpfr-dev \
+            libmpc-dev libisl-dev zlib1g-dev zstd wget rsync git
+
+      - name: Cache built toolchain
+        # No restore-keys: an exact (gcc-ref + config + patches) match is the
+        # only acceptable reuse for a compiler.
+        id: tc-cache
+        uses: actions/cache@v6
+        with:
+          path: toolchain-out
+          key: sh2eb-tc-${{ steps.pin.outputs.gcc_ref }}-${{ hashFiles('tests/j2/toolchain/config.mak', 'tests/j2/toolchain/patches/**', 'tests/j2/toolchain/*.gitref') }}
+
+      - name: Build GCC-17 sh2eb toolchain
+        if: steps.tc-cache.outputs.cache-hit != 'true' || inputs.force_toolchain
+        run: tests/j2/toolchain/build-toolchain.sh
+
+      - name: Upload toolchain artifact (consumed by kernel-rootfs this run)
+        uses: actions/upload-artifact@v7
+        with:
+          name: sh2eb-toolchain
+          path: toolchain-out/sh2eb-toolchain.tar.zst
+          retention-days: 7
+
+      - name: Publish toolchain Release (best effort; skipped under act)
+        if: ${{ !env.ACT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$TOOLCHAIN_TAG" --yes --cleanup-tag || true
+          gh release create "$TOOLCHAIN_TAG" --prerelease \
+            --title "sh2eb-linux-muslfdpic GCC-$GCC_VER (gcc @ ${{ steps.pin.outputs.gcc_ref }})" \
+            --notes "Pinned GCC-17 FDPIC toolchain for the J2 boot CI." \
+            toolchain-out/sh2eb-toolchain.tar.zst || true
+
+  build-qemu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.J2_BRANCH }}
+      - name: Install QEMU build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config libglib2.0-dev \
+            libpixman-1-dev python3 python3-venv ccache
+
+      - name: Cache qemu-system-sh4eb (this exact commit)
+        id: qemu-bin-cache
+        uses: actions/cache@v6
+        with:
+          path: build/qemu-system-sh4eb
+          key: qemu-bin-sh4eb-${{ github.sha }}
+      - name: Cache ccache
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-sh2eb-${{ github.sha }}
+          restore-keys: ccache-sh2eb-
+      - name: Configure
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        run: |
+          # Trim meson's auto features to what a headless -display none boot
+          # test needs (mirrors the Dreamcast job).
+          ./configure --target-list=sh4eb-softmmu --disable-docs \
+            --enable-slirp --cc="ccache gcc" \
+            -Dgtk=disabled -Dvnc=disabled -Dsdl=disabled -Dsdl_image=disabled \
+            -Dcurses=disabled -Dcurl=disabled -Dlibssh=disabled -Dspice=disabled \
+            -Dspice_protocol=disabled -Dvnc_jpeg=disabled -Dvnc_sasl=disabled \
+            -Dopengl=disabled -Dvirglrenderer=disabled -Dbrlapi=disabled \
+            -Ddbus_display=disabled -Dselinux=disabled -Dcapstone=disabled
+      - name: Build qemu-system-sh4eb
+        if: steps.qemu-bin-cache.outputs.cache-hit != 'true'
+        run: ninja -C build qemu-system-sh4eb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: qemu-system-sh4eb
+          path: build/qemu-system-sh4eb
+          retention-days: 7
+
+  kernel-rootfs:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: build-toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      linux-next-sha: ${{ steps.clone.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.J2_BRANCH }}
+      - name: Install kernel + rootfs deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libncurses-dev libelf-dev \
+            rsync cpio fakeroot gzip zstd dtc wget git
+
+      - name: Fetch toolchain (this run's artifact)
+        uses: actions/download-artifact@v8
+        with:
+          name: sh2eb-toolchain
+          path: tc
+      - name: Unpack toolchain
+        run: |
+          mkdir -p "$HOME/x-tools/sh2eb"
+          tar -C "$HOME/x-tools/sh2eb" --zstd -xf tc/sh2eb-toolchain.tar.zst
+          echo "$HOME/x-tools/sh2eb/bin" >> "$GITHUB_PATH"
+      - name: Toolchain sanity
+        run: sh2eb-linux-muslfdpic-gcc -dumpmachine
+
+      - name: Cache rootfs image
+        id: rootfs-cache
+        uses: actions/cache@v6
+        with:
+          path: rootfs-out
+          key: j2-rootfs-${{ hashFiles('tests/j2/rootfs/**') }}-tc${{ hashFiles('tests/j2/toolchain/gcc.gitref') }}
+      - name: Build initramfs (toybox + busybox hush + soak tools)
+        if: steps.rootfs-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p rootfs-out
+          TOOLBIN="$HOME/x-tools/sh2eb/bin" OUT="$PWD/rootfs-out/jcore-initramfs.cpio.gz" \
+            tests/j2/rootfs/build-rootfs.sh
+
+      - name: Clone linux-next
+        id: clone
+        run: |
+          git clone --depth 1 \
+            https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git linux-next
+          SHA=$(git -C linux-next rev-parse HEAD)
+          echo "LINUX_NEXT_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Apply guarded J2 patches
+        run: cd linux-next && "$GITHUB_WORKSPACE/tests/j2/kernel/apply-patches.sh"
+
+      - name: Build vmlinux (DTB + initramfs embedded)
+        run: |
+          cp rootfs-out/jcore-initramfs.cpio.gz linux-next/usr/jcore-initramfs.cpio.gz
+          cd linux-next
+          make ARCH=sh CROSS_COMPILE=sh2eb-linux-muslfdpic- j2_defconfig
+          scripts/kconfig/merge_config.sh -m -O . .config \
+            "$GITHUB_WORKSPACE/tests/j2/kernel/j2-ci.config"
+          make ARCH=sh CROSS_COMPILE=sh2eb-linux-muslfdpic- olddefconfig
+          make ARCH=sh CROSS_COMPILE=sh2eb-linux-muslfdpic- -j"$(nproc)" vmlinux
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: j2-kernel
+          path: |
+            linux-next/vmlinux
+            rootfs-out/jcore-initramfs.cpio.gz
+          retention-days: 7
+      - name: Publish nightly kernel (skipped under act)
+        if: ${{ !env.ACT }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$NIGHTLY_TAG" --yes --cleanup-tag || true
+          gh release create "$NIGHTLY_TAG" --prerelease \
+            --title "Nightly J2 vmlinux (linux-next)" \
+            --notes "linux-next @ ${LINUX_NEXT_SHA}" \
+            linux-next/vmlinux rootfs-out/jcore-initramfs.cpio.gz
+
+  boot-test:
+    needs: [build-qemu, kernel-rootfs]
+    if: always() && needs.build-qemu.result == 'success' && needs.kernel-rootfs.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.J2_BRANCH }}
+      - name: Install QEMU runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-0 libpixman-1-0 libslirp0 python3
+      - uses: actions/download-artifact@v8
+        with:
+          name: qemu-system-sh4eb
+          path: build
+      - run: chmod +x build/qemu-system-sh4eb
+      # Kernel source: this run's artifact when kernel-rootfs ran (nightly/
+      # dispatch), else the last nightly Release (push/PR fast path).
+      - name: Download same-run kernel artifact
+        if: needs.kernel-rootfs.result == 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: j2-kernel
+          path: kern
+      - name: Fetch last nightly kernel Release
+        if: needs.kernel-rootfs.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p kern
+          gh release download "$NIGHTLY_TAG" -p vmlinux --clobber --dir kern
+      - name: Locate vmlinux
+        id: vm
+        run: |
+          VM=$(find kern -name vmlinux 2>/dev/null | head -1)
+          echo "path=$VM" >> "$GITHUB_OUTPUT"
+          test -n "$VM"
+      - name: Run J2 boot-regression test
+        timeout-minutes: 12
+        run: |
+          python3 tests/j2/boot/mainline_boot_test.py \
+            --qemu build/qemu-system-sh4eb --kernel "${{ steps.vm.outputs.path }}" \
+            --kernel-sha "${{ needs.kernel-rootfs.outputs.linux-next-sha }}" \
+            --boot-timeout 300 --tap
+
+  report-regression:
+    needs: [kernel-rootfs, boot-test]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.J2_BRANCH }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="J2 boot regression: nightly run failed ($(date -u +%F))"
+          BODY="Nightly linux-next J2 boot-regression CI failed. Run: \
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING=$(gh issue list --label "$REGRESSION_LABEL" --state open --json number \
+            --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "$REGRESSION_LABEL"
+          fi
