@@ -67,7 +67,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCMapleState, DC_MAPLE)
 #define VMU_SUBMASK      0x01       /* controller reports a device in slot 1 */
 
 #define MAPLE_POLL_HZ    60      /* DMA is paced to VBLANK on real hardware */
-#define MAPLE_XFER_US    2000    /* a four-port DEVINFO scan at 2 Mbps */
+/*
+ * How long a transfer occupies the bus.  A four-port DEVINFO scan really
+ * takes ~2000us at 2 Mbps, but modelling that exposes a guest race in
+ * drivers/sh/maple/maple.c: both bottom halves bail out of maple_send() on
+ * a busy bus, after maple_dma_handler() has already cleared MAPLE_ENABLE,
+ * so the DMA is never re-armed and the bus wedges (keyboard stops polling).
+ * Default to an immediate transfer and let DC_MAPLE_XFER_US opt in, which
+ * is what the maple race reproducer does.
+ */
+#define MAPLE_XFER_US    0
 
 struct DCMapleState {
     SysBusDevice parent_obj;
@@ -378,6 +387,16 @@ static void maple_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case MAPLE_ENABLE:
         s->enable = val;
+        if (!(val & 1)) {
+            /*
+             * Disabling the engine stops a transfer in progress; leaving it
+             * "in flight" would keep MAPLE_STATE busy after the guest has
+             * taken the bus back, and maple_send() bails out on a busy bus
+             * without re-arming the DMA - wedging it for good.
+             */
+            s->busy = false;
+            timer_del(s->xfer);
+        }
         break;
     case MAPLE_TRIGTYPE:
         s->trigtype = val & 1;

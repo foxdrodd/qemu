@@ -76,6 +76,17 @@ LAN `0x00600400`. Boot params page at `0x8c001000` (`CONFIG_CMDLINE_OVERWRITE`).
   the completion interrupt relative to the instruction stream is what exposes
   such races. ~10 kHz reproduces the maple queue corruption in ~1 boot in 3;
   see `dcemulator/scratchpad/maple_race_repro.py`.
+- **…but a non-zero transfer time wedges the bus, so it is opt-in.**
+  `MAPLE_XFER_US` defaults to 0 and only `DC_MAPLE_XFER_US` turns it on. With a
+  real busy window the guest deadlocks itself: `maple_dma_handler()` clears
+  `MAPLE_ENABLE`, then its closing `maple_send()` hits `if (!maple_dma_done())
+  return;` and never reaches `maple_dma_reset()`, so the DMA is never re-armed.
+  The bus goes silent — the keyboard stops polling and input dies on the
+  framebuffer console while the ttySC1 console still works, which is the
+  symptom to recognise. Reverting the two bottom halves to one ordered
+  workqueue does not fix it either. Model it properly by driving the trigger
+  off the PVR's VSYNC rather than an independent 60 Hz timer, which is what
+  real `TRIGTYPE == 1` does, before making it the default.
 - **PVR pixel depth comes from `DIWMODE` bits 2-3, NOT register `0x108`.** pvr2fb
   overloads `0x108`: it's the pixel-depth *and* the palette-type register, so X's
   colormap setup clobbers it. Reading depth from `0x108` gave bytespp=1 → width
