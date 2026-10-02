@@ -64,6 +64,18 @@ LAN `0x00600400`. Boot params page at `0x8c001000` (`CONFIG_CMDLINE_OVERWRITE`).
 - **Maple polling is VSYNC-driven**: the kernel queues GETCOND from its VBLANK
   handler (Holly event 5). Without the PVR raising 60 Hz VSYNC, only DEVINFO PnP
   scans happen and no keys/mouse motion ever arrive.
+- **Maple transfers take time and re-trigger themselves.** `MAPLE_STATE` bit 0
+  reads busy while a transfer is in flight, and with `MAPLE_TRIGTYPE == 1` the
+  controller re-runs the same command list on every VBLANK on its own, so
+  `MAPLE_ENABLE` stays armed (only a software trigger is one-shot). Modelling
+  this synchronously — instant transfer, always-idle `MAPLE_STATE`, one-shot
+  enable — hides every guest-side race in `drivers/sh/maple/maple.c`, because
+  the DMA and VBLANK bottom halves then never overlap. `DC_MAPLE_XFER_US`,
+  `DC_MAPLE_JITTER_US` and `DC_MAPLE_POLL_HZ` (env, read in `maple_realize()`)
+  slide that timing: guest execution is near-deterministic under TCG, so moving
+  the completion interrupt relative to the instruction stream is what exposes
+  such races. ~10 kHz reproduces the maple queue corruption in ~1 boot in 3;
+  see `dcemulator/scratchpad/maple_race_repro.py`.
 - **PVR pixel depth comes from `DIWMODE` bits 2-3, NOT register `0x108`.** pvr2fb
   overloads `0x108`: it's the pixel-depth *and* the palette-type register, so X's
   colormap setup clobbers it. Reading depth from `0x108` gave bytespp=1 → width

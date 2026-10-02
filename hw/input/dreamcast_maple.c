@@ -67,16 +67,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCMapleState, DC_MAPLE)
 #define VMU_SUBMASK      0x01       /* controller reports a device in slot 1 */
 
 #define MAPLE_POLL_HZ    60      /* DMA is paced to VBLANK on real hardware */
+#define MAPLE_XFER_US    2000    /* a four-port DEVINFO scan at 2 Mbps */
 
 struct DCMapleState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq;               /* Holly MAPLE_DMA event */
-    QEMUTimer *timer;
+    QEMUTimer *timer;           /* VBLANK tick that triggers transfers */
+    QEMUTimer *xfer;            /* completion of an in-flight transfer  */
 
     uint32_t dmaaddr;
     uint32_t enable;
+    uint32_t trigtype;          /* 0 = software trigger, 1 = VBLANK     */
+    bool busy;                  /* transfer in flight (MAPLE_STATE bit 0) */
+    int64_t xfer_ns;            /* how long a transfer occupies the bus */
+    int64_t jitter_ns;          /* spread added to it, 0 = fixed timing */
+    int poll_hz;                /* VBLANK trigger rate                  */
 
     HIDState kbd;               /* keyboard on port 0 */
     HIDState mouse;             /* mouse on port 1    */
@@ -316,13 +323,32 @@ static void maple_timer(void *opaque)
 {
     DCMapleState *s = opaque;
 
-    if (s->enable & 1) {
-        maple_process_dma(s);
-        s->enable = 0;              /* one-shot per trigger */
-        qemu_set_irq(s->irq, 1);    /* Holly latches MAPLE_DMA (edge) */
+    if ((s->enable & 1) && !s->busy) {
+        /*
+         * Start a transfer.  It occupies the bus for a while, so MAPLE_STATE
+         * reads busy until maple_xfer_done() runs.  With MAPLE_TRIGTYPE == 1
+         * the controller re-runs the same command list on every VBLANK by
+         * itself and MAPLE_ENABLE stays armed; a software trigger is one-shot.
+         */
+        s->busy = true;
+        if (!s->trigtype) {
+            s->enable = 0;
+        }
+        timer_mod(s->xfer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->xfer_ns +
+                  (s->jitter_ns ? g_random_int_range(0, s->jitter_ns) : 0));
     }
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / MAPLE_POLL_HZ);
+              NANOSECONDS_PER_SECOND / s->poll_hz);
+}
+
+/* The in-flight transfer completes: write the responses, then interrupt. */
+static void maple_xfer_done(void *opaque)
+{
+    DCMapleState *s = opaque;
+
+    maple_process_dma(s);
+    s->busy = false;
+    qemu_set_irq(s->irq, 1);        /* Holly latches MAPLE_DMA (edge) */
 }
 
 static uint64_t maple_read(void *opaque, hwaddr addr, unsigned int size)
@@ -335,7 +361,7 @@ static uint64_t maple_read(void *opaque, hwaddr addr, unsigned int size)
     case MAPLE_ENABLE:
         return s->enable;
     case MAPLE_STATE:
-        return 0;                   /* DMA is processed synchronously: idle */
+        return s->busy ? 1 : 0;     /* bit 0: a transfer is in progress */
     default:
         return 0;
     }
@@ -352,6 +378,15 @@ static void maple_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case MAPLE_ENABLE:
         s->enable = val;
+        break;
+    case MAPLE_TRIGTYPE:
+        s->trigtype = val & 1;
+        break;
+    case MAPLE_RESET:
+        s->enable = 0;
+        s->trigtype = 0;
+        s->busy = false;
+        timer_del(s->xfer);
         break;
     default:
         break;
@@ -379,6 +414,11 @@ static void maple_reset_hold(Object *obj, ResetType type)
 
     s->dmaaddr = 0;
     s->enable = 0;
+    s->trigtype = 0;
+    s->busy = false;
+    if (s->xfer) {
+        timer_del(s->xfer);
+    }
     hid_reset(&s->kbd);
     hid_reset(&s->mouse);
 }
@@ -396,18 +436,34 @@ static void maple_realize(DeviceState *dev, Error **errp)
     hid_init(&s->kbd, HID_KEYBOARD, maple_input_event);
     hid_init(&s->mouse, HID_MOUSE, maple_input_event);
 
+    /*
+     * Bus timing knobs.  Guest execution under TCG is deterministic, so a
+     * guest-side race either always reproduces or never does; sliding the
+     * transfer length moves the DMA-completion interrupt relative to the
+     * guest's instruction stream, which is what exposes such races.
+     */
+    s->xfer_ns = 1000 * (getenv("DC_MAPLE_XFER_US")
+                         ? atoi(getenv("DC_MAPLE_XFER_US")) : MAPLE_XFER_US);
+    s->jitter_ns = 1000 * (getenv("DC_MAPLE_JITTER_US")
+                           ? atoi(getenv("DC_MAPLE_JITTER_US")) : 0);
+    s->poll_hz = getenv("DC_MAPLE_POLL_HZ")
+                 ? atoi(getenv("DC_MAPLE_POLL_HZ")) : MAPLE_POLL_HZ;
+
+    s->xfer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maple_xfer_done, s);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, maple_timer, s);
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / MAPLE_POLL_HZ);
+              NANOSECONDS_PER_SECOND / s->poll_hz);
 }
 
 static const VMStateDescription vmstate_maple = {
     .name = "dc-maple",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dmaaddr, DCMapleState),
         VMSTATE_UINT32(enable, DCMapleState),
+        VMSTATE_UINT32(trigtype, DCMapleState),
+        VMSTATE_BOOL(busy, DCMapleState),
         VMSTATE_HID_KEYBOARD_DEVICE(kbd, DCMapleState),
         VMSTATE_HID_POINTER_DEVICE(mouse, DCMapleState),
         VMSTATE_END_OF_LIST()
