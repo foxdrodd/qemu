@@ -18,6 +18,7 @@ bare-metal test blob live **outside** this tree in the harness project:
 | `hw/display/dreamcast_ta.c` | PowerVR2 tile accelerator (`dc-ta`): software TBDR. Parses the real TA parameter stream (FIFO at `0x10000000`) into triangle lists and rasterises opaque/punch/translucent into VRAM on STARTRENDER (per-pixel Z, Gouraud, textured 1555/565/4444 twiddled+linear, bilinear, blend), then raises "end of render" (Holly event 2). Pragmatic: no bit-exact OPB binning; textures fetched linearly. |
 | `hw/input/dreamcast_maple.c` | Maple bus (`dc-maple`): keyboard on port 0 + mouse on port 1, both via QEMU `HIDState`. |
 | `hw/net/dreamcast_la.c` | Sega LAN Adapter (`dc-lanadapter`), Fujitsu MB86967 10 Mbit NIC. |
+| `hw/char/dreamcast_modem.c` | Modem (`dc-modem`): Rockwell/Conexant data pump register file, phone line on a chardev. See "G2 modem". |
 | `hw/sh4/sh7750.c` | SH7750/SH7091 SoC. Added `sh7750_set_porta()` + PCTRA/PDTRA read cases. |
 | `hw/char/sh_serial.c` | SCIF serial; `can_receive` fix (use `rx_cnt`, not `rx_head`, or pasted input drops). |
 | `include/hw/sh4/sh.h` | Prototypes for the `dc_*_init()` board helpers. |
@@ -106,6 +107,12 @@ tool calls (use one standalone script); socket paths must be < 108 bytes (use
 `/tmp`); evdev char devices can't be read with `od` (it `lseek`s → EINVAL) — verify
 input at the device level with a temporary `fprintf` in the driver instead.
 
+`dc_integration_test.py` keeps one QEMU log and one guest console log per
+scenario (`<scenario>-<n>-{qemu,console}.log`) in its artifact dir, and keeps
+that dir whenever a check fails (or with `--keep-artifacts`); the path is
+printed at the end. Outside the test, `dcboot.py` still writes a single
+`/tmp/dcboot-<pid>.log` unless `DCBoot.log_dir` is set.
+
 ## RTL8139 / Broadband Adapter via GAPS PCI bridge — DONE
 
 Implemented in `hw/pci-host/dreamcast_gaps.c`. Verified: `8139too` binds,
@@ -156,6 +163,59 @@ Wiring: `hw/pci-host/{meson.build,Kconfig}` (`CONFIG_DREAMCAST_GAPS` select PCI 
 rtl8139), `DREAMCAST` selects it, `dc_gaps_init()` in `dreamcast.c`. NIC choice
 LAN-vs-BBA via a machine property or `-nic model=`. Reference host bridges:
 `hw/pci-host/{dino,grackle}.c`.
+
+## G2 modem — model done, awaiting real-hardware comparison
+
+`hw/char/dreamcast_modem.c` (`dc-modem`), opt-in with
+`-M dreamcast,modem=<chardev-id>`. It sits in the LAN adapter's slot
+(`0x00600400`, reg N at `+N*4`, G2 reset at `+0x80`, Holly event 34), so
+`modem=` together with `-nic model=dc-lanadapter` is a fatal error; the BBA
+stays available. Guest driver: `drivers/tty/dcmodem.c` in the DC-Linux tree
+(`/dev/ttyDCM0`, in-kernel AT interpreter).
+
+The modem is a controllerless data pump: no AT commands, the guest opens the
+line, dials DTMF and starts the handshake through 32 registers plus a DSP RAM
+window (`MEADDL/MEADDH/MEDAL`, strobe `MEACC`). **The only reference is the
+KallistiOS driver** (`/opt/toolchains/dc/kos/kernel/arch/dreamcast/hardware/modem/`),
+not a datasheet, so the model implements what that driver relies on:
+
+- Reset (G2 reset release, or `SFRES`+`NEWC`) presents the self-test words for
+  20 ms: controller signature first, DSP signature after the second read of
+  `TBUFFER` (KOS reads the controller block twice), then `NEWC` clears.
+- "New status" interrupts: an unmasked change of a status register sets `NEWS`;
+  the masks live in DSP RAM (`0x241`-`0x247`, `0x370`, `0x38A`). `TDBE`+`TDBIE`
+  is the second source (used while dialling).
+- Call: off hook (`RA`) -> dial tone if the chardev is open -> digits written
+  to `TBUFFER` in dial mode (`CONF=0x81`), 100 ms each -> answer tone (`ATV25`)
+  1.5 s after the last digit, only if the chardev is open -> `DTR` starts a 3 s
+  fake handshake (`SECRXB` phases) -> `RLSD|CTS|DSR`, `CONF=0xCE`, `SPEED=16`
+  (V.34 33600). No line signal is modelled.
+- Data: 128-byte FIFOs paced to 33600 bps on a 10 ms timer. Chardev close =
+  far-end hangup (carrier drops); guest hangup calls `qemu_chr_fe_disconnect`.
+
+Gotchas:
+- **`lan_adapter` leaves the slot in reset.** Its probe pulses the G2 reset
+  `0,1,0`; with the reset asserted the modem's registers all read 0. The modem
+  driver must claim the slot first (it does: `drivers/tty` links before
+  `drivers/net`, and both `request_region()` the same range).
+- **The interrupt is edge-pulsed into Holly** (like the LAN adapter), not a
+  level. A guest handler that leaves `NEWS` set gets no second interrupt here,
+  whereas real hardware would storm. Clear `NEWS` before reading the status.
+- **An empty slot echoes the address.** On a real console with a BBA (so
+  nothing in the 8-bit slot) every byte at `0x006004xx` reads as the low byte
+  of its own address (`0x74` at `+0x74`). That passes the self test's TDBE
+  (`0x78` has bit 3) and NEWC (`0x7c` has bit 0 clear) checks by accident, so
+  only the signature compare rejects it. `dreamcast.c` now maps
+  `dc.g2-empty-slot` with exactly that behaviour when neither modem nor LAN
+  adapter is fitted; before, the slot read as 0 and hid this.
+- `/dev/mem` `read()` returns EFAULT for device addresses on this kernel; poke
+  registers from the guest with an `mmap()`-based devmem (the userland has gcc).
+
+Testing: `DCBoot(modem=<unix socket path>)` in `dcboot.py` makes
+QEMU a reconnecting client of a socket the test listens on (the far-end
+modem); `dc_integration_test.py --with-modem` covers probe, `ATI`, dial to
+`CONNECT 33600`, data round-trip and `NO CARRIER`. For real PPP use a pty
+chardev and `tests/dreamcast/modem_ppp_host.sh` (host `pppd`, optional NAT).
 
 ## VMU (Visual Memory Unit) — DONE
 
@@ -444,3 +504,8 @@ test. New Holly event 2 (`HOLLY_EV_PVR_RENDER`, end-of-render TSP). Route change
 Not done: AICA sound; TA modifier volumes / sprites / palette+VQ+YUV textures; VMU RTC sub-function; CI
 `push`/`pull_request` triggers still disabled (only `workflow_dispatch` +
 nightly `schedule` enabled — see "Mainline boot-regression CI" above).
+G2 modem (2026-10-02): `dc_integration_test.py --with-modem` passes against the
+`dcmodem` driver (probe, `ATI`, dial to `CONNECT 33600`, 25 KB intact both ways,
+`+++`/`ATH`, far-end hangup). Still open: a real PPP session against
+`modem_ppp_host.sh` (needs sudo), comparison with a real modem / DreamPi, and
+the KallistiOS EQM-triggered retrain, which the driver does not port.

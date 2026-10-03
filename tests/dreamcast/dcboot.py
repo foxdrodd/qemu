@@ -56,8 +56,15 @@ _PC_BIOS_DIR = os.path.normpath(os.path.join(
 
 
 class DCBoot:
+    # Set log_dir to keep one QEMU log and one guest console log per booted
+    # instance, named <log_tag>-<n>-{qemu,console}.log, instead of reusing a
+    # single /tmp/dcboot-<pid>.log that the next boot overwrites.
+    log_dir = None
+    log_tag = None
+    _nlogs = 0
+
     def __init__(self, kernel=None, drives=None, vmu=None, net=False,
-                 wav=None, audiodev=None, vmu_lcd=False, mem=16,
+                 wav=None, audiodev=None, vmu_lcd=False, modem=None, mem=16,
                  machine="dreamcast", qemu=DEF_QEMU, extra=None,
                  symbols=None, gdb_bin=DEF_GDB,
                  prompt="Please press Enter", shell="root@dreamcast"):
@@ -69,6 +76,7 @@ class DCBoot:
         self.wav = wav
         self.audiodev = audiodev
         self.vmu_lcd = vmu_lcd
+        self.modem = modem                 # unix socket path of the phone line
         self.mem = mem
         self.machine = machine
         self.extra = list(extra or [])
@@ -91,12 +99,24 @@ class DCBoot:
         self._seq = 0
 
     # ---- process lifecycle ----
+    def _open_log(self):
+        self.console_log = None
+        if not DCBoot.log_dir:
+            return open("/tmp/dcboot-%d.log" % os.getpid(), "wb")
+        DCBoot._nlogs += 1
+        stem = os.path.join(DCBoot.log_dir, "%s-%d" % (
+            DCBoot.log_tag or "dcboot", DCBoot._nlogs))
+        self.console_log = stem + "-console.log"
+        return open(stem + "-qemu.log", "wb")
+
     def _argv(self):
         mach = self.machine
         if self.vmu_lcd:
             mach += ",vmu-lcd=on"
         if self.wav or self.audiodev:
             mach += ",audiodev=snd"
+        if self.modem:
+            mach += ",modem=mdm"
         av = [self.qemu, "-M", mach, "-m", str(self.mem),
               "-display", "none", "-no-reboot", "-serial", "null"]
         if os.path.isdir(_PC_BIOS_DIR):
@@ -124,6 +144,9 @@ class DCBoot:
             av += ["-audiodev", "%s,id=snd" % self.audiodev]
         if self.net:
             av += ["-nic", "user"]
+        if self.modem:         # the far end of the call listens on this socket
+            av += ["-chardev", "socket,id=mdm,path=%s,reconnect-ms=200"
+                   % self.modem]
         return av + self.extra
 
     def boot(self, timeout=150):
@@ -132,7 +155,7 @@ class DCBoot:
                 os.unlink(f)
             except OSError:
                 pass
-        self.log = open("/tmp/dcboot-%d.log" % os.getpid(), "wb")
+        self.log = self._open_log()
         self.p = subprocess.Popen(self._argv(), stdout=self.log,
                                   stderr=subprocess.STDOUT)
         self.ser = self._wsock(self.ser_path)
@@ -239,7 +262,7 @@ class DCBoot:
                 os.unlink(f)
             except OSError:
                 pass
-        self.log = open("/tmp/dcboot-%d.log" % os.getpid(), "wb")
+        self.log = self._open_log()
         self.p = subprocess.Popen(self._argv(), stdout=self.log,
                                   stderr=subprocess.STDOUT)
         end = time.time() + 15
@@ -341,6 +364,9 @@ class DCBoot:
         self._teardown()
 
     def _teardown(self):
+        if getattr(self, "console_log", None):
+            with open(self.console_log, "wb") as f:
+                f.write(bytes(self.buf))
         if self.p and self.p.poll() is None:
             self.p.terminate()
             try:

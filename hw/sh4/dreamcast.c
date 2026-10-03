@@ -41,6 +41,7 @@
 #include "system/blockdev.h"
 #include "system/dma.h"
 #include "net/net.h"
+#include "chardev/char.h"
 
 /*
  * Dreamcast physical memory map (SH-4 Area layout).
@@ -82,6 +83,33 @@ static void main_cpu_reset(void *opaque)
 
 /* Sega LAN Adapter (HIT-0300) G2 I/O base. */
 #define LANADAPTER_BASE    0x00600400
+#define G2_SLOT_SIZE       0x100
+
+/*
+ * An empty 8-bit G2 slot.  A real console with a Broadband Adapter fitted
+ * reads each byte there as the low byte of its own address (the modem
+ * driver's self test saw 0x74 at 0x00600474, 0x00 at 0x00600400, ...), so
+ * drivers probing the slot see that, not zeroes.  Writes go nowhere.
+ */
+static uint64_t g2_empty_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return addr & 0xff;
+}
+
+static void g2_empty_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+}
+
+static const MemoryRegionOps g2_empty_ops = {
+    .read = g2_empty_read,
+    .write = g2_empty_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
+};
 /* Maple bus controller register base. */
 #define MAPLE_BASE         0x005f6c00
 
@@ -239,11 +267,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(DreamcastMachineState, DREAMCAST_MACHINE)
 struct DreamcastMachineState {
     MachineState parent_obj;
     bool vmu_lcd;               /* present the VMU LCD as a second display */
+    char *modem;                /* chardev id of the modem's phone line */
 };
 
 static void dreamcast_init(MachineState *machine)
 {
     const char *kernel_filename = machine->kernel_filename;
+    DreamcastMachineState *dms = DREAMCAST_MACHINE(machine);
     SuperHCPU *cpu;
     CPUSH4State *env;
     ResetData *reset_info;
@@ -305,13 +335,37 @@ static void dreamcast_init(MachineState *machine)
     /*
      * G2 networking.  The Broadband Adapter (RTL8139 behind the GAPS PCI
      * bridge, IRQ via Holly event 35) is the default; "-nic ...,model=
-     * dc-lanadapter" selects the older Sega LAN Adapter instead.
+     * dc-lanadapter" selects the older Sega LAN Adapter instead.  "-M
+     * dreamcast,modem=<chardev>" fits the modem, which shares the LAN
+     * Adapter's 8-bit slot and event line, so the two exclude each other.
      */
+    if (dms->modem) {
+        Chardev *chr = qemu_chr_find(dms->modem);
+
+        if (!chr) {
+            error_report("qemu: modem chardev '%s' not found", dms->modem);
+            exit(1);
+        }
+        if (qemu_find_nic_info("dc-lanadapter", false, NULL)) {
+            error_report("qemu: the modem and the LAN adapter share a slot");
+            exit(1);
+        }
+        dc_modem_init(LANADAPTER_BASE,
+                      qdev_get_gpio_in(holly, HOLLY_EV_LAN), chr);
+    }
     if (qemu_find_nic_info("dc-lanadapter", false, NULL)) {
         dc_lanadapter_init(LANADAPTER_BASE,
                            qdev_get_gpio_in(holly, HOLLY_EV_LAN));
     } else {
         dc_gaps_init(qdev_get_gpio_in(holly, HOLLY_EV_EXTERNAL));
+        if (!dms->modem) {
+            MemoryRegion *g2_empty = g_new(MemoryRegion, 1);
+
+            memory_region_init_io(g2_empty, NULL, &g2_empty_ops, NULL,
+                                  "dc.g2-empty-slot", G2_SLOT_SIZE);
+            memory_region_add_subregion(address_space_mem, LANADAPTER_BASE,
+                                        g2_empty);
+        }
     }
 
     /*
@@ -426,6 +480,19 @@ static void dreamcast_set_vmu_lcd(Object *obj, bool value, Error **errp)
     DREAMCAST_MACHINE(obj)->vmu_lcd = value;
 }
 
+static char *dreamcast_get_modem(Object *obj, Error **errp)
+{
+    return g_strdup(DREAMCAST_MACHINE(obj)->modem);
+}
+
+static void dreamcast_set_modem(Object *obj, const char *value, Error **errp)
+{
+    DreamcastMachineState *dms = DREAMCAST_MACHINE(obj);
+
+    g_free(dms->modem);
+    dms->modem = g_strdup(value);
+}
+
 static void dreamcast_machine_init(MachineClass *mc)
 {
     mc->desc = "Sega Dreamcast";
@@ -439,6 +506,11 @@ static void dreamcast_machine_init(MachineClass *mc)
                                    dreamcast_set_vmu_lcd);
     object_class_property_set_description(OBJECT_CLASS(mc), "vmu-lcd",
         "Show the VMU LCD as a second display (needs a VMU -drive)");
+
+    object_class_property_add_str(OBJECT_CLASS(mc), "modem",
+                                  dreamcast_get_modem, dreamcast_set_modem);
+    object_class_property_set_description(OBJECT_CLASS(mc), "modem",
+        "Fit the modem, with this chardev id as its phone line");
 }
 
 DEFINE_MACHINE_EXTENDED("dreamcast", MACHINE, DreamcastMachineState,
