@@ -78,6 +78,9 @@ uint32_t dc_gdrom_data_lba(DeviceState *dev);
 /* hw/net/dreamcast_la.c */
 void dc_lanadapter_init(hwaddr base, qemu_irq irq);
 
+/* hw/char/dreamcast_modem.c - modem in the same G2 slot, line on a chardev. */
+void dc_modem_init(hwaddr base, qemu_irq irq, Chardev *chr);
+
 /* hw/pci-host/dreamcast_gaps.c */
 void dc_gaps_init(qemu_irq irq);
 

@@ -20,8 +20,10 @@ Config resolves from env ($DC_QEMU, $DC_KERNEL) and the distro build/ dir; see
 """
 import argparse
 import os
+import socket
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -292,6 +294,81 @@ def scenario_audio(cfg, res):
               lambda: need(peak > 1000, "silent WAV (peak=%d)" % peak))
 
 
+def scenario_modem(cfg, res):
+    """Modem: AT commands, a dialled call, data both ways, far-end hangup.
+
+    The phone line is a unix socket; this side is the answering modem and
+    echoes what it receives in upper case.
+    """
+    if not os.path.exists(cfg.iso):
+        res.add("modem", FAIL, "iso missing")
+        return
+    line = "/tmp/dc-itest-modem-%d.sock" % os.getpid()
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(line)
+    srv.listen(1)
+    hangup = threading.Event()
+
+    def far_end():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.settimeout(0.2)
+            while not hangup.is_set():
+                try:
+                    data = conn.recv(256)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                conn.sendall(data.upper())
+            conn.close()
+            hangup.clear()
+    threading.Thread(target=far_end, daemon=True).start()
+
+    dc = DCBoot(kernel=cfg.kernel, drives=[cfg.iso], modem=line, qemu=cfg.qemu)
+    try:
+        try:
+            dc.boot(timeout=cfg.boot_timeout)
+        except Exception as e:
+            res.add("modem: boot with modem fitted", FAIL, str(e))
+            return
+        res.check("modem: driver probed",
+                  lambda: has(dc.run("dmesg | grep dcmodem"), "Dreamcast modem"))
+        res.check("modem: /dev/ttyDCM0 present",
+                  lambda: has(dc.run("ls /dev/ttyDCM0 2>&1"), "/dev/ttyDCM0"))
+
+        def seen(pat, timeout):
+            end = time.time() + timeout
+            while time.time() < end:
+                if pat in dc.run("cat /tmp/modem.out"):
+                    return True
+                time.sleep(1)
+            return False
+
+        dc.run("exec 3<>/dev/ttyDCM0")              # keep the port open
+        dc.run("cat <&3 >/tmp/modem.out &")
+        dc.run("printf 'ATI\\r' >&3")
+        res.check("modem: ATI answers",
+                  lambda: need(seen("Dreamcast modem", 5), "no ATI reply"))
+        dc.run("printf 'ATDT5551234\\r' >&3")
+        res.check("modem: dial reaches CONNECT 33600",
+                  lambda: need(seen("CONNECT 33600", 40), "no CONNECT"))
+        dc.run("printf 'dcmodem-ping\\n' >&3")
+        res.check("modem: data round-trip",
+                  lambda: need(seen("DCMODEM-PING", 10), "no echo"))
+        hangup.set()                                # the far end hangs up
+        res.check("modem: far-end hangup gives NO CARRIER",
+                  lambda: need(seen("NO CARRIER", 15), "no NO CARRIER"))
+        res.check("modem: no panic/oops in dmesg", lambda: _dmesg_clean(dc))
+    finally:
+        dc.close()
+        srv.close()
+        os.unlink(line)
+
+
 def scenario_gdb(cfg, res):
     """gdbstub kernel debugging: attach gdb, break in a driver, confirm it hits.
 
@@ -339,6 +416,8 @@ def build_config():
                     help="run the AICA sound test (needs the sound branch)")
     ap.add_argument("--with-lcd", action="store_true",
                     help="run the VMU LCD screendump test")
+    ap.add_argument("--with-modem", action="store_true",
+                    help="run the modem test (needs CONFIG_DREAMCAST_MODEM)")
     ap.add_argument("--with-gdb", action="store_true",
                     help="run the gdbstub kernel-debugging test (needs "
                          "gdb-multiarch)")
@@ -371,10 +450,16 @@ def main():
         scenarios.append(scenario_lcd)
     if cfg.with_audio:
         scenarios.append(scenario_audio)
+    if cfg.with_modem:
+        scenarios.append(scenario_modem)
     if cfg.with_gdb:
         scenarios.append(scenario_gdb)
 
+    # One QEMU log and one guest console log per boot, named after the
+    # scenario, so a failed boot still has its evidence at the end of the run.
+    DCBoot.log_dir = cfg.artdir
     for sc in scenarios:
+        DCBoot.log_tag = sc.__name__.replace("scenario_", "")
         try:
             sc(cfg, res)
         except Exception:
@@ -383,8 +468,8 @@ def main():
 
     code = res.tap() if cfg.tap else res.summary()
 
-    if cfg.keep_artifacts:
-        print("artifacts kept in %s" % cfg.artdir)
+    if cfg.keep_artifacts or res.n(FAIL):
+        print("artifacts (per-scenario logs) kept in %s" % cfg.artdir)
     else:
         import shutil
         shutil.rmtree(cfg.artdir, ignore_errors=True)
