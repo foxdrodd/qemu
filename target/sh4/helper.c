@@ -236,6 +236,34 @@ static int itlb_replacement(CPUSH4State * env)
 /* Find the corresponding entry in the right TLB
    Return entry, MMU_DTLB_MISS or MMU_DTLB_MULTIPLE
 */
+/*
+ * Drop the QEMU TLB pages an SH TLB entry may have filled: all of its 1K-1M
+ * page, not only the target page at its VPN.
+ */
+static void flush_tlb_entry(CPUSH4State *env, tlb_t *entry)
+{
+    vaddr start = (entry->vpn << 10) & ~(vaddr)(entry->size - 1);
+
+    if (entry->size <= TARGET_PAGE_SIZE) {
+        tlb_flush_page(env_cpu(env), start);
+    } else {
+        /* sh4 has MMU_KERNEL_IDX 0 and MMU_USER_IDX 1 */
+        tlb_flush_range_by_mmuidx(env_cpu(env), start, entry->size,
+                                  (1 << MMU_USER_IDX) | 1, TARGET_LONG_BITS);
+    }
+}
+
+/*
+ * Associative writes compare the VPN in units of the entry's page size, so
+ * an address anywhere inside a 64K or 1M page hits that entry.
+ */
+static bool tlb_entry_vpn_match(tlb_t *entry, uint32_t vpn)
+{
+    uint32_t mask = ~((entry->size >> 10) - 1);
+
+    return ((entry->vpn ^ vpn) & mask) == 0;
+}
+
 static int find_tlb_entry(CPUSH4State *env, vaddr address,
                           tlb_t * entries, uint8_t nbtlb, int use_asid)
 {
@@ -286,7 +314,7 @@ static int copy_utlb_entry_itlb(CPUSH4State *env, int utlb)
     itlb = itlb_replacement(env);
     ientry = &env->itlb[itlb];
     if (ientry->v) {
-        tlb_flush_page(env_cpu(env), ientry->vpn << 10);
+        flush_tlb_entry(env, ientry);
     }
     *ientry = env->utlb[utlb];
     update_itlb_use(env, itlb);
@@ -457,8 +485,7 @@ void cpu_load_tlb(CPUSH4State * env)
 
     if (entry->v) {
         /* Overwriting valid entry in utlb. */
-        vaddr address = entry->vpn << 10;
-        tlb_flush_page(cs, address);
+        flush_tlb_entry(env, entry);
     }
 
     /* Take values into cpu status from registers. */
@@ -533,8 +560,7 @@ void cpu_sh4_write_mmaped_itlb_addr(CPUSH4State *s, hwaddr addr,
     tlb_t * entry = &s->itlb[index];
     if (entry->v) {
         /* Overwriting valid entry in itlb. */
-        vaddr address = entry->vpn << 10;
-        tlb_flush_page(env_cpu(s), address);
+        flush_tlb_entry(s, entry);
     }
     entry->asid = asid;
     entry->vpn = vpn;
@@ -575,8 +601,7 @@ void cpu_sh4_write_mmaped_itlb_data(CPUSH4State *s, hwaddr addr,
         /* ITLB Data Array 1 */
         if (entry->v) {
             /* Overwriting valid entry in utlb. */
-            vaddr address = entry->vpn << 10;
-            tlb_flush_page(env_cpu(s), address);
+            flush_tlb_entry(s, entry);
         }
         entry->ppn = (mem_value & 0x1ffffc00) >> 10;
         entry->v   = (mem_value & 0x00000100) >> 8;
@@ -618,7 +643,6 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
     if (associate) {
         int i;
         tlb_t * utlb_match_entry = NULL;
-        int needs_tlb_flush = 0;
 
         /* search UTLB */
         for (i = 0; i < UTLB_SIZE; i++) {
@@ -626,7 +650,7 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
             if (!entry->v)
                 continue;
 
-            if (entry->vpn == vpn
+            if (tlb_entry_vpn_match(entry, vpn)
                 && (!use_asid || entry->asid == asid || entry->sh)) {
                 if (utlb_match_entry) {
                     CPUState *cs = env_cpu(s);
@@ -637,7 +661,7 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
                     break;
                 }
                 if (entry->v && !v)
-                    needs_tlb_flush = 1;
+                    flush_tlb_entry(s, entry);
                 entry->v = v;
                 entry->d = d;
                 utlb_match_entry = entry;
@@ -648,10 +672,10 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
         /* search ITLB */
         for (i = 0; i < ITLB_SIZE; i++) {
             tlb_t * entry = &s->itlb[i];
-            if (entry->vpn == vpn
+            if (tlb_entry_vpn_match(entry, vpn)
                 && (!use_asid || entry->asid == asid || entry->sh)) {
                 if (entry->v && !v)
-                    needs_tlb_flush = 1;
+                    flush_tlb_entry(s, entry);
                 if (utlb_match_entry)
                     *entry = *utlb_match_entry;
                 else
@@ -660,18 +684,12 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
             }
         }
 
-        if (needs_tlb_flush) {
-            tlb_flush_page(env_cpu(s), vpn << 10);
-        }
     } else {
         int index = (addr & 0x00003f00) >> 8;
         tlb_t * entry = &s->utlb[index];
         if (entry->v) {
-            CPUState *cs = env_cpu(s);
-
             /* Overwriting valid entry in utlb. */
-            vaddr address = entry->vpn << 10;
-            tlb_flush_page(cs, address);
+            flush_tlb_entry(s, entry);
         }
         entry->asid = asid;
         entry->vpn = vpn;
@@ -721,8 +739,7 @@ void cpu_sh4_write_mmaped_utlb_data(CPUSH4State *s, hwaddr addr,
         /* UTLB Data Array 1 */
         if (entry->v) {
             /* Overwriting valid entry in utlb. */
-            vaddr address = entry->vpn << 10;
-            tlb_flush_page(env_cpu(s), address);
+            flush_tlb_entry(s, entry);
         }
         entry->ppn = (mem_value & 0x1ffffc00) >> 10;
         entry->v   = (mem_value & 0x00000100) >> 8;

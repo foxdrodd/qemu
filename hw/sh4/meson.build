@@ -4,6 +4,7 @@ sh4_ss.add(when: 'CONFIG_SH7750', if_true: files(
   'sh7750_regnames.c',
 ))
 sh4_ss.add(when: 'CONFIG_R2D', if_true: files('r2d.c'))
+sh4_ss.add(when: 'CONFIG_LANDISK', if_true: files('landisk.c'))
 sh4_ss.add(when: 'CONFIG_DREAMCAST', if_true: files('dreamcast.c'))
 
 hw_arch += {'sh4': sh4_ss}

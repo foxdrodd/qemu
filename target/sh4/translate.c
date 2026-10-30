@@ -1807,6 +1807,18 @@ static void decode_opc(DisasContext * ctx)
         tcg_gen_movi_i32(cpu_flags, ctx->envflags);
         if (old_flags & TB_FLAG_DELAY_SLOT_COND) {
             gen_delayed_conditional_jump(ctx);
+        } else if (old_flags & TB_FLAG_DELAY_SLOT_RTE) {
+            /*
+             * rte has restored SR, which may unblock a pending interrupt.
+             * The exit request for it was consumed while the delay slot
+             * was pending, so go back to the main loop to look at it
+             * again; chaining into the next TB would only notice it at
+             * the next exception, which sets SR.BL first.
+             */
+            tcg_gen_mov_i32(cpu_pc, cpu_delayed_pc);
+            tcg_gen_discard_i32(cpu_delayed_pc);
+            tcg_gen_exit_tb(NULL, 0);
+            ctx->base.is_jmp = DISAS_NORETURN;
         } else {
             gen_jump(ctx);
         }

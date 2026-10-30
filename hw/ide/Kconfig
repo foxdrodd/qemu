@@ -25,6 +25,10 @@ config IDE_PIIX
     bool
     select IDE_PCI
 
+config IDE_ATP865
+    bool
+    select IDE_PCI
+
 config IDE_CMD646
     bool
     select IDE_PCI

@@ -13,6 +13,18 @@ config R2D
     select SH7750
     select SH_PCI
 
+config LANDISK
+    bool
+    default y
+    depends on SH4
+    imply PCI_DEVICES
+    imply RTL8139_PCI
+    select IDE_ATP865
+    select IDE_MMIO
+    select PCI
+    select SH7750
+    select SH_PCI
+
 config DREAMCAST
     bool
     default y
