@@ -77,6 +77,10 @@ void superh_cpu_do_interrupt(CPUState *cs)
                initrd, they need to be reloaded and the program counter
                should be loaded with the kernel entry point.
                qemu_system_reset_request takes care of that.  */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "sh4: exception 0x%03x with SR.BL=1 at pc=0x%08x "
+                          "tea=0x%08x spc=0x%08x -> reset\n",
+                          cs->exception_index, env->pc, env->tea, env->spc);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             return;
         }
@@ -236,6 +240,22 @@ static int itlb_replacement(CPUSH4State * env)
 /* Find the corresponding entry in the right TLB
    Return entry, MMU_DTLB_MISS or MMU_DTLB_MULTIPLE
 */
+/* Page size in bytes for a TLB SZ field: 00=1K, 01=4K, 10=64K, 11=1M. */
+static uint32_t tlb_sz_to_size(uint8_t sz)
+{
+    static const uint32_t sizes[4] = { 1024, 4 * 1024, 64 * 1024, 1024 * 1024 };
+
+    return sizes[sz & 3];
+}
+
+/* Does @vpn (address bits 31:10) fall in the page mapped by @entry? */
+static bool tlb_vpn_match(const tlb_t *entry, uint32_t vpn)
+{
+    uint32_t size = entry->size ? entry->size : 1024;
+
+    return (((entry->vpn ^ vpn) << 10) & ~(size - 1)) == 0;
+}
+
 static int find_tlb_entry(CPUSH4State *env, vaddr address,
                           tlb_t * entries, uint8_t nbtlb, int use_asid)
 {
@@ -270,7 +290,11 @@ static void increment_urc(CPUSH4State * env)
     urb = ((env->mmucr) >> 18) & 0x3f;
     urc = ((env->mmucr) >> 10) & 0x3f;
     urc++;
-    if ((urb > 0 && urc > urb) || urc > (UTLB_SIZE - 1))
+    /*
+     * URC is cleared when it reaches URB, so entries URB..63 are never
+     * replaced by LDTLB (NetBSD wires its kernel stack there).
+     */
+    if ((urb > 0 && urc >= urb) || urc > (UTLB_SIZE - 1))
         urc = 0;
     env->mmucr = (env->mmucr & 0xffff03ff) | (urc << 10);
 }
@@ -467,24 +491,8 @@ void cpu_load_tlb(CPUSH4State * env)
     entry->v    = (uint8_t)cpu_ptel_v(env->ptel);
     entry->ppn  = cpu_ptel_ppn(env->ptel);
     entry->sz   = (uint8_t)cpu_ptel_sz(env->ptel);
-    switch (entry->sz) {
-    case 0: /* 00 */
-        entry->size = 1024; /* 1K */
-        break;
-    case 1: /* 01 */
-        entry->size = 1024 * 4; /* 4K */
-        break;
-    case 2: /* 10 */
-        entry->size = 1024 * 64; /* 64K */
-        break;
-    case 3: /* 11 */
-        entry->size = 1024 * 1024; /* 1M */
-        break;
-    default:
-        cpu_abort(cs, "Unhandled load_tlb");
-        break;
-    }
-    entry->sh   = (uint8_t)cpu_ptel_sh(env->ptel);
+    entry->size = tlb_sz_to_size(entry->sz);
+    entry->sh  = (uint8_t)cpu_ptel_sh(env->ptel);
     entry->c    = (uint8_t)cpu_ptel_c(env->ptel);
     entry->pr   = (uint8_t)cpu_ptel_pr(env->ptel);
     entry->d    = (uint8_t)cpu_ptel_d(env->ptel);
@@ -582,6 +590,13 @@ void cpu_sh4_write_mmaped_itlb_data(CPUSH4State *s, hwaddr addr,
         entry->v   = (mem_value & 0x00000100) >> 8;
         entry->sz  = (mem_value & 0x00000080) >> 6 |
                      (mem_value & 0x00000010) >> 4;
+        /*
+         * find_tlb_entry() matches on 'size'; leaving it stale (0 for an
+         * entry never loaded by LDTLB) makes it cover the whole address
+         * space -> spurious multiple-hit.  NetBSD wires its kernel stack
+         * through this path in cpu_switchto.
+         */
+        entry->size = tlb_sz_to_size(entry->sz);
         entry->pr  = (mem_value & 0x00000040) >> 5;
         entry->c   = (mem_value & 0x00000008) >> 3;
         entry->sh  = (mem_value & 0x00000002) >> 1;
@@ -620,13 +635,22 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
         tlb_t * utlb_match_entry = NULL;
         int needs_tlb_flush = 0;
 
+        /*
+         * An associative write is matched like a translation: against the
+         * ASID in PTEH (not the ASID field of the written data), and only on
+         * the VPN bits that are significant for each entry's page size.
+         * NetBSD invalidates with data = (va & ~0x3ff) and the target ASID
+         * in PTEH; Linux puts the ASID in both places.
+         */
+        asid = s->pteh & 0xff;
+
         /* search UTLB */
         for (i = 0; i < UTLB_SIZE; i++) {
             tlb_t * entry = &s->utlb[i];
             if (!entry->v)
                 continue;
 
-            if (entry->vpn == vpn
+            if (tlb_vpn_match(entry, vpn)
                 && (!use_asid || entry->asid == asid || entry->sh)) {
                 if (utlb_match_entry) {
                     CPUState *cs = env_cpu(s);
@@ -648,7 +672,7 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
         /* search ITLB */
         for (i = 0; i < ITLB_SIZE; i++) {
             tlb_t * entry = &s->itlb[i];
-            if (entry->vpn == vpn
+            if (entry->v && tlb_vpn_match(entry, vpn)
                 && (!use_asid || entry->asid == asid || entry->sh)) {
                 if (entry->v && !v)
                     needs_tlb_flush = 1;
@@ -661,7 +685,8 @@ void cpu_sh4_write_mmaped_utlb_addr(CPUSH4State *s, hwaddr addr,
         }
 
         if (needs_tlb_flush) {
-            tlb_flush_page(env_cpu(s), vpn << 10);
+            /* the matched entry may span more than one target page */
+            tlb_flush(env_cpu(s));
         }
     } else {
         int index = (addr & 0x00003f00) >> 8;
@@ -728,6 +753,13 @@ void cpu_sh4_write_mmaped_utlb_data(CPUSH4State *s, hwaddr addr,
         entry->v   = (mem_value & 0x00000100) >> 8;
         entry->sz  = (mem_value & 0x00000080) >> 6 |
                      (mem_value & 0x00000010) >> 4;
+        /*
+         * find_tlb_entry() matches on 'size'; leaving it stale (0 for an
+         * entry never loaded by LDTLB) makes it cover the whole address
+         * space -> spurious multiple-hit.  NetBSD wires its kernel stack
+         * through this path in cpu_switchto.
+         */
+        entry->size = tlb_sz_to_size(entry->sz);
         entry->pr  = (mem_value & 0x00000060) >> 5;
         entry->c   = (mem_value & 0x00000008) >> 3;
         entry->d   = (mem_value & 0x00000004) >> 2;

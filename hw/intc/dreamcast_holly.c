@@ -53,16 +53,23 @@ struct DCHollyState {
 
 static void holly_update_irl(DCHollyState *s)
 {
-    /* diagonal EMR index and IRL-encoded value for IRQ13, IRQ11, IRQ9.
-     * irl_enc = index ^ 15:  IRQ13->13^15=2, IRQ11->11^15=4, IRQ9->9^15=6 */
-    static const int emr_idx[3] = { 0, 5, 10 };
+    /*
+     * Each IRL level has a full set of three masks (NRM/EXT/ERR):
+     *   IRQ13: 0x6910/14/18 (emr[0..2])   IRQ11: 0x6920/24/28 (emr[4..6])
+     *   IRQ9:  0x6930/34/38 (emr[8..10])
+     * Linux only programs the diagonal (NRM->13, EXT->11, ERR->9); NetBSD
+     * routes e.g. Maple DMA (NRM) and GD-ROM/AICA (EXT) to IRQ9.
+     * irl_enc = index ^ 15:  IRQ13->13^15=2, IRQ11->11^15=4, IRQ9->9^15=6
+     */
     static const int irl_enc[3] = { 2, 4, 6 };
-    int i;
+    int i, j;
 
-    for (i = 0; i < 3; i++) {          /* i == 0 (IRQ13) is highest priority */
-        if (s->esr[i] & s->emr[emr_idx[i]]) {
-            qemu_set_irq(s->irl, irl_enc[i]);
-            return;
+    for (i = 0; i < 3; i++) {          /* i == 0 (IRQ13) is checked first */
+        for (j = 0; j < 3; j++) {
+            if (s->esr[j] & s->emr[i * 4 + j]) {
+                qemu_set_irq(s->irl, irl_enc[i]);
+                return;
+            }
         }
     }
     qemu_set_irq(s->irl, 0);           /* nothing pending: deassert all */

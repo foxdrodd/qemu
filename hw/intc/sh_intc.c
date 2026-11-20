@@ -77,26 +77,60 @@ static void sh_intc_set_irq(void *opaque, int n, int level)
     }
 }
 
+static int sh_intc_source_priority(struct intc_source *source)
+{
+    return source->priority < 0 ? 15 : source->priority;
+}
+
+/*
+ * Return the vector of the highest-priority pending source whose priority
+ * is above SR.IMASK, or -1 if every pending source is masked.  A source is
+ * accepted only when its priority is strictly greater than IMASK; guests
+ * that nest interrupts by level (NetBSD spl) depend on this.
+ */
 int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
 {
+    struct intc_source *best = NULL;
+    int best_prio = imask;
     unsigned int i;
 
     /* slow: use a linked lists of pending sources instead */
-    /* wrong: take interrupt priority into account (one list per priority) */
-
-    if (imask == 0x0f) {
-        return -1; /* FIXME, update code to include priority per source */
-    }
-
     for (i = 0; i < desc->nr_sources; i++) {
         struct intc_source *source = &desc->sources[i];
+        int prio;
 
-        if (source->pending) {
-            trace_sh_intc_pending(desc->pending, source->vect);
-            return source->vect;
+        if (!source->pending) {
+            continue;
+        }
+        prio = sh_intc_source_priority(source);
+        if (prio > best_prio) {
+            best = source;
+            best_prio = prio;
         }
     }
-    g_assert_not_reached();
+
+    if (!best) {
+        return -1;
+    }
+    trace_sh_intc_pending(desc->pending, best->vect);
+    return best->vect;
+}
+
+/* Record an IPR field's priority on a source (and its group members). */
+static void sh_intc_set_priority(struct intc_desc *desc, intc_enum id,
+                                 int prio, int is_group)
+{
+    struct intc_source *source = &desc->sources[id];
+
+    if (!id) {
+        return;
+    }
+    if (source->vect) {
+        source->priority = prio;
+    }
+    if ((is_group || !source->vect) && source->next_enum_id) {
+        sh_intc_set_priority(desc, source->next_enum_id, prio, 1);
+    }
 }
 
 typedef enum {
@@ -242,6 +276,10 @@ static void sh_intc_write(void *opaque, hwaddr offset,
         mask = (1 << width) - 1;
         mask <<= (first - k) * width;
 
+        if (mode & INTC_MODE_IS_PRIO) {
+            sh_intc_set_priority(desc, enum_ids[k],
+                                 (value & mask) >> ((first - k) * width), 0);
+        }
         if ((*valuep & mask) != (value & mask)) {
             sh_intc_toggle_mask(desc, enum_ids[k], value & mask, 0);
         }
@@ -401,6 +439,7 @@ int sh_intc_init(MemoryRegion *sysmem,
     desc->sources = g_new0(struct intc_source, nr_sources);
     for (i = 0; i < nr_sources; i++) {
         desc->sources[i].parent = desc;
+        desc->sources[i].priority = -1;
     }
     desc->irqs = qemu_allocate_irqs(sh_intc_set_irq, desc, nr_sources);
     memory_region_init_io(&desc->iomem, NULL, &sh_intc_ops, desc, "intc",
@@ -440,6 +479,7 @@ void sh_intc_set_irl(void *opaque, int n, int level)
     for (i = 0; id; id = s->next_enum_id, i++) {
         s = &s->parent->sources[id];
         if (i == irl) {
+            s->priority = level;    /* IRL3-0 encode the priority level */
             sh_intc_toggle_source(s, s->enable_count ? 0 : 1,
                                   s->asserted ? 0 : 1);
         } else if (s->asserted) {

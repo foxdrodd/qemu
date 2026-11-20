@@ -165,15 +165,18 @@ static bool pvr_get_mode(DCPvrState *s, uint32_t *width, uint32_t *height,
         rows *= 2;
     }
 
-    addr = s->regs[DISP_DIWADDRL / 4] & 0x1fffffff;
-    if (addr < VRAM_PHYS_BASE) {
-        return false;
-    }
+    /*
+     * FB_R_SOF1 is an offset into VRAM: the hardware decodes only the low
+     * bits (23:2).  Linux pvr2fb writes the 0xa5xxxxxx view address, NetBSD
+     * writes the bare offset (0) -- both must land on the same VRAM byte.
+     */
+    addr = s->regs[DISP_DIWADDRL / 4] & 0x00fffffc;
+    addr &= memory_region_size(s->vram) - 1;
 
     *src_width = line_bytes;
     *width = line_bytes / bytespp;
     *height = rows;
-    *fb_offset = addr - VRAM_PHYS_BASE;
+    *fb_offset = addr;
 
     return *width != 0 && *height != 0;
 }

@@ -509,3 +509,25 @@ G2 modem (2026-10-02): `dc_integration_test.py --with-modem` passes against the
 `+++`/`ATH`, far-end hangup). Still open: a real PPP session against
 `modem_ppp_host.sh` (needs sudo), comparison with a real modem / DreamPi, and
 the KallistiOS EQM-triggered retrain, which the driver does not port.
+
+## NetBSD/dreamcast 11.1 — boots to installer shell (2026-11-20)
+
+`-kernel netbsd-GENERIC_MD` (ELF @0x8c010000) boots to `(I)nstall, (S)hell`.
+Kernels + launcher: `/media/flo/nvme0-ssd/netbsd-dc/` (`run-netbsd.sh [gui]`;
+`*-serial` = `scifconsole` patched to 1 → console on 2nd `-serial`).
+NetBSD exercised paths Linux never touches; all fixed here:
+- PVR: `FB_R_SOF1` is a VRAM *offset* (NetBSD writes 0) — mask, don't require 0xa5xxxxxx.
+- MMU: URC must wrap at `URC == URB` (wired entries >= URB; NetBSD URB=61).
+- MMU: UTLB/ITLB *data-array* writes must recompute `size` (else size=0 → entry
+  matches everything → multi-hit → reset vector 0xa0000000).
+- MMU: associative UTLB address-array write compares PTEH.ASID (not data ASID)
+  and only page-size-significant VPN bits.
+- INTC: priority masking was a FIXME (only IMASK=15 masked). Now per-source
+  priority from IPR fields / IRL level; accepted only if prio > IMASK. Without it
+  NetBSD's spl nesting re-takes TMU0 forever and trapframes overrun BSS.
+- Maple: software trigger (MDTSEL=0) starts on `MDST=1` write (NetBSD); VBLANK
+  auto-start only with MDTSEL=1 (Linux).
+- Holly: full 3x3 EMR matrix (NetBSD routes Maple NRM + GD-ROM/AICA EXT to IRL9).
+- Diagnostic: exceptions with SR.BL=1 now log `-d guest_errors` before the reset.
+Open: rtk0 (BBA) `watchdog timeout` — TSD shows TOK but no TX-done IRQ reaches
+Holly EXT; not yet debugged. gdb reading 0xffd00006 aborts in sh_intc_locate.

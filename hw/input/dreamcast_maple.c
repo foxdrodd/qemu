@@ -328,23 +328,29 @@ static void maple_process_dma(DCMapleState *s)
     }
 }
 
+/*
+ * Start a transfer.  It occupies the bus for a while, so MAPLE_STATE reads
+ * busy until maple_xfer_done() runs.
+ */
+static void maple_start_xfer(DCMapleState *s)
+{
+    s->busy = true;
+    timer_mod(s->xfer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->xfer_ns +
+              (s->jitter_ns ? g_random_int_range(0, s->jitter_ns) : 0));
+}
+
 static void maple_timer(void *opaque)
 {
     DCMapleState *s = opaque;
 
-    if ((s->enable & 1) && !s->busy) {
-        /*
-         * Start a transfer.  It occupies the bus for a while, so MAPLE_STATE
-         * reads busy until maple_xfer_done() runs.  With MAPLE_TRIGTYPE == 1
-         * the controller re-runs the same command list on every VBLANK by
-         * itself and MAPLE_ENABLE stays armed; a software trigger is one-shot.
-         */
-        s->busy = true;
-        if (!s->trigtype) {
-            s->enable = 0;
-        }
-        timer_mod(s->xfer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->xfer_ns +
-                  (s->jitter_ns ? g_random_int_range(0, s->jitter_ns) : 0));
+    /*
+     * With MAPLE_TRIGTYPE == 1 (Linux) the controller re-runs the command
+     * list on every VBLANK by itself while MAPLE_ENABLE stays armed.  With
+     * the software trigger (TRIGTYPE == 0, NetBSD) a transfer starts only
+     * when the guest writes 1 to MAPLE_STATE; see maple_write().
+     */
+    if (s->trigtype && (s->enable & 1) && !s->busy) {
+        maple_start_xfer(s);
     }
     timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / s->poll_hz);
@@ -396,6 +402,12 @@ static void maple_write(void *opaque, hwaddr addr, uint64_t val,
              */
             s->busy = false;
             timer_del(s->xfer);
+        }
+        break;
+    case MAPLE_STATE:
+        /* software trigger: writing 1 starts one DMA transfer */
+        if ((val & 1) && !s->trigtype && (s->enable & 1) && !s->busy) {
+            maple_start_xfer(s);
         }
         break;
     case MAPLE_TRIGTYPE:

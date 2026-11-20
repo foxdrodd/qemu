@@ -41,6 +41,7 @@ struct intc_source {
     int enable_count;
     int enable_max;
     int pending; /* emulates the result of signal and masking */
+    int priority; /* 1..15 from IPR field or IRL level; -1 = unknown (15) */
     struct intc_desc *parent;
 };
 
