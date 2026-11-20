@@ -343,7 +343,16 @@ static void sh_serial_timeout_int(void *opaque)
 {
     SHSerialState *s = opaque;
 
-    s->flags |= SH_SERIAL_FLAG_RDF;
+    /*
+     * Receive timeout: below-trigger data has been sitting in the FIFO, so
+     * the hardware flags DR.  If the guest already drained the FIFO (e.g.
+     * by polling) there is nothing to report; raising a flag with an empty
+     * FIFO makes NetBSD's scifintr() spin forever.
+     */
+    if (s->rx_cnt == 0) {
+        return;
+    }
+    s->flags |= SH_SERIAL_FLAG_DR;
     if (s->scr & (1 << 6) && s->rxi) {
         qemu_set_irq(s->rxi, 1);
     }

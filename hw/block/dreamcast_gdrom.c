@@ -112,10 +112,12 @@ struct DCGdromState {
     uint8_t packet[12];
     int packet_idx;
 
-    /* PIO data-in buffer (IDENTIFY / TOC / sense) */
+    /* PIO data-in buffer (IDENTIFY / TOC / sense / PIO CD read sector) */
     uint8_t  pio[GDROM_SECTOR];
     uint32_t pio_len;
     uint32_t pio_idx;
+    int pkt_data;                   /* packet command is in its DRQ data-in phase */
+    int pio_read;                   /* CD_READ is being served by PIO, not DMA */
 
     /* pending DMA read request */
     uint32_t read_fad, read_count;
@@ -187,11 +189,18 @@ static void gdrom_packet_dispatch(DCGdromState *s)
         s->pio_idx = 0;
         break;
     case SPI_CDREAD:
-        /* Latch the read; the transfer starts on the DMA_STATUS write. */
         s->read_fad = (s->packet[2] << 16) | (s->packet[3] << 8) | s->packet[4];
         s->read_count = (s->packet[8] << 16) | (s->packet[9] << 8) | s->packet[10];
-        s->dma_pending = 1;
-        return;                         /* no PIO completion */
+        if (s->feature & 1) {
+            /* DMA (Linux): latch; the transfer starts on the DMA_STATUS write */
+            s->dma_pending = 1;
+            return;                     /* no PIO completion */
+        }
+        /* PIO (NetBSD): sectors go out through the data port, one per DRQ */
+        s->pio_read = 1;
+        s->pio_len = 0;
+        s->pio_idx = 0;
+        break;
     case SPI_TESTUNIT:
     case SPI_PREPDISK:
     default:
@@ -236,12 +245,64 @@ static void gdrom_do_dma(DCGdromState *s)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GDROM_CMD_DELAY_NS);
 }
 
+/* Load the next sector of a PIO CD read into the PIO buffer. */
+static void gdrom_pio_load_sector(DCGdromState *s)
+{
+    uint32_t data_fad = s->data_lba + GDROM_SESSION_FAD;
+    uint32_t rel = s->read_fad - data_fad;
+
+    memset(s->pio, 0, GDROM_SECTOR);
+    if (s->blk && s->read_fad >= data_fad && rel < s->n_sectors) {
+        int64_t off = s->data_off + (int64_t)rel * s->raw_size + s->sec_hdr;
+        blk_pread(s->blk, off, GDROM_SECTOR, s->pio, 0);
+    }
+    s->read_fad++;
+    s->read_count--;
+    s->pio_len = GDROM_SECTOR;
+    s->pio_idx = 0;
+}
+
+/*
+ * Advance a packet command after its BSY period, ATAPI PIO data-in style:
+ * while data remains, present it with DRQ and the byte count in BCL/BCH and
+ * interrupt; the guest drains the data port (gdrom_read), which sets BSY and
+ * re-arms the timer.  Once nothing is left, clear DRQ and post the final
+ * completion interrupt.  Linux reads the data after the first interrupt and
+ * waits for !BSY before its next command; NetBSD drains in its handler.
+ */
+static void gdrom_packet_step(DCGdromState *s)
+{
+    if (s->pio_read && s->pio_idx >= s->pio_len && s->read_count) {
+        gdrom_pio_load_sector(s);
+    }
+    if (s->pio_idx < s->pio_len) {
+        uint32_t n = s->pio_len - s->pio_idx;
+
+        s->status |= GDS_DRQ;
+        s->bcl = n & 0xff;
+        s->bch = (n >> 8) & 0xff;
+        s->pkt_data = 1;
+    } else {
+        s->status &= ~GDS_DRQ;
+        s->pkt_data = 0;
+        s->pio_read = 0;
+        s->pending_cmd = 0;
+    }
+    s->post_cmd_irq = 0;
+    qemu_set_irq(s->irq_cmd, 1);        /* Holly latches the ESR bit (edge) */
+}
+
 static void gdrom_cmd_complete(void *opaque)
 {
     DCGdromState *s = opaque;
 
     s->status &= ~GDS_BSY;
     s->status |= GDS_DRDY | GDS_DSC;
+
+    if (s->pending_cmd == GDC_PACKET) {
+        gdrom_packet_step(s);
+        return;
+    }
 
     switch (s->pending_cmd) {
     case GDC_EXECDIAG:
@@ -301,6 +362,12 @@ static uint64_t gdrom_read(void *opaque, hwaddr addr, unsigned int size)
                 w |= s->pio[s->pio_idx + 1] << 8;
             }
             s->pio_idx += 2;
+            if (s->pkt_data && s->pio_idx >= s->pio_len) {
+                /* block drained: busy until the next DRQ or the final status */
+                s->status = (s->status & ~GDS_DRQ) | GDS_BSY;
+                timer_mod(s->cmd_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          GDROM_CMD_DELAY_NS);
+            }
         }
         return w;
     }
@@ -534,6 +601,7 @@ static void gdrom_reset_hold(Object *obj, ResetType type)
     s->packet_idx = 0;
     memset(s->packet, 0, sizeof(s->packet));
     s->pio_len = s->pio_idx = 0;
+    s->pkt_data = s->pio_read = 0;
     s->read_fad = s->read_count = 0;
     s->dma_pending = 0;
     s->dma_addr = s->dma_len = s->dma_dir = s->dma_enable = 0;
@@ -541,8 +609,8 @@ static void gdrom_reset_hold(Object *obj, ResetType type)
 
 static const VMStateDescription vmstate_dreamcast_gdrom = {
     .name = "dc-gdrom",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(n_sectors, DCGdromState),
         VMSTATE_UINT32(data_lba, DCGdromState),
@@ -565,6 +633,8 @@ static const VMStateDescription vmstate_dreamcast_gdrom = {
         VMSTATE_UINT8_ARRAY(pio, DCGdromState, GDROM_SECTOR),
         VMSTATE_UINT32(pio_len, DCGdromState),
         VMSTATE_UINT32(pio_idx, DCGdromState),
+        VMSTATE_INT32(pkt_data, DCGdromState),
+        VMSTATE_INT32(pio_read, DCGdromState),
         VMSTATE_UINT32(read_fad, DCGdromState),
         VMSTATE_UINT32(read_count, DCGdromState),
         VMSTATE_INT32(dma_pending, DCGdromState),

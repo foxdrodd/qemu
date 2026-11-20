@@ -531,3 +531,10 @@ NetBSD exercised paths Linux never touches; all fixed here:
 - Diagnostic: exceptions with SR.BL=1 now log `-d guest_errors` before the reset.
 Open: rtk0 (BBA) `watchdog timeout` — TSD shows TOK but no TX-done IRQ reaches
 Holly EXT; not yet debugged. gdb reading 0xffd00006 aborts in sh_intc_locate.
+Full userland: `netbsd-GENERIC` + base/etc sets on a Rock Ridge ISO built with
+`-C 0,11702` (NetBSD gdrom also uses FAD = LBA+150 and CDIOREADMSADDR) → answer
+`gdrom0a`/`cd9660` at the root prompt → single-user shell on ro cd9660 root.
+Needed two more fixes: GD-ROM ATAPI **PIO** data-in (DRQ + BCL/BCH + IRQ per
+block, final IRQ after drain; CD_READ via PIO when feature bit0 = 0 — Linux sets
+1 for DMA), and SCIF receive-timeout must not raise a flag with an empty FIFO
+(sets DR, not RDF) — else NetBSD `scifintr()` spins forever.
