@@ -2,7 +2,7 @@
 # Build qemu-system-sh4 (with -M dreamcast) for the browser and assemble a
 # servable web directory.
 #
-#   contrib/dreamcast-web/build.sh [disc.cdi|disc.iso]
+#   contrib/dreamcast-web/build.sh [disc.cdi|disc.iso]   (symlinked as web/disc.*)
 #
 # Needs the "qemu-emsdk-wasm" image, built from
 # tests/docker/dockerfiles/emsdk-wasm64-cross.docker (zlib URL fixed to the
@@ -53,6 +53,9 @@ cp -r "$WEB_SRC/vendor" "$OUT/"
 mkdir -p "$OUT/rom"
 cp "$SRC/pc-bios/efi-rtl8139.rom" "$OUT/rom/"
 if [ -n "$DISC" ]; then
-  cp "$DISC" "$OUT/disc.${DISC##*.}"
+  # Symlinked, not copied: the page streams it with Range requests, so the
+  # 700+ MiB userland discs are fine.  (Use rsync -L to deploy elsewhere.)
+  rm -f "$OUT"/disc.cdi "$OUT"/disc.iso
+  ln -s "$(realpath "$DISC")" "$OUT/disc.${DISC##*.}"
 fi
 ls -la "$OUT"

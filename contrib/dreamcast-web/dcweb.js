@@ -136,11 +136,23 @@ async function main() {
     return;
   }
 
+  // A disc given by URL is streamed: QEMU's wasm-http block driver fetches
+  // chunks with Range requests as the guest reads them.  A locally picked
+  // file (or ?preload) is copied into MEMFS in full instead.
   let disc;
   const discUrl = params.get("disc") || document.body.dataset.disc;
   if (discUrl) {
+    const abs = new URL(discUrl, location.href).href;
     try {
-      disc = { name: discUrl, data: await fetchDisc(discUrl) };
+      const head = await fetch(abs, { method: "HEAD" });
+      if (!head.ok) throw new Error(`HTTP ${head.status}`);
+      const size = +head.headers.get("Content-Length") || 0;
+      const ranges = /bytes/i.test(head.headers.get("Accept-Ranges") || "");
+      if (ranges && !params.has("preload")) {
+        disc = { name: discUrl, url: abs, size };
+      } else {
+        disc = { name: discUrl, data: await fetchDisc(abs) };
+      }
     } catch (e) {
       status(`Could not load ${discUrl} (${e.message}); pick a disc image.`);
       disc = await pickLocalDisc();
@@ -150,7 +162,7 @@ async function main() {
     disc = await pickLocalDisc();
   }
   const ext = /\.iso$/i.test(disc.name) ? "iso" : "cdi";
-  const discPath = `/disc.${ext}`;
+  const discPath = disc.url || `/disc.${ext}`;
 
   const roms = {};
   for (const r of ["efi-rtl8139.rom"]) {
@@ -168,7 +180,8 @@ async function main() {
     "-serial", "null",
     "-serial", "stdio",
     "-nic", params.get("nic") || "user",
-    "-drive", `if=none,file=${discPath},format=raw,readonly=on`,
+    "-drive", `if=none,file=${discPath},format=raw,readonly=on` +
+              (disc.url && params.get("cache") ? `,file.cache-size=${params.get("cache")}` : ""),
   ];
   if (!params.has("nolcd")) {
     args.push("-drive", "if=none,file=/vmu.bin,format=raw");
@@ -176,7 +189,9 @@ async function main() {
   const extra = params.get("args");
   if (extra) args.push(...extra.split(" ").filter(Boolean));
 
-  status("Starting QEMU…");
+  status(disc.url ? `Starting QEMU… (streaming ${disc.name}, ` +
+                    `${(disc.size / 1048576).toFixed(0)} MiB, on demand)`
+                  : "Starting QEMU…");
   const t0 = performance.now();
   let firstOutput = true;
   let booted = false;
@@ -190,8 +205,10 @@ async function main() {
       for (const [name, data] of Object.entries(roms)) {
         mod.FS.writeFile(`/rom/${name}`, data);
       }
-      mod.FS.writeFile(discPath, disc.data);
-      disc.data = null;
+      if (disc.data) {
+        mod.FS.writeFile(discPath, disc.data);
+        disc.data = null;
+      }
       if (!params.has("nolcd")) {
         // Blank 128 KiB VMU; the guest sees it as /dev/mtd0.
         mod.FS.writeFile("/vmu.bin", new Uint8Array(128 * 1024));

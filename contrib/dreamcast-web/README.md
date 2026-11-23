@@ -9,7 +9,7 @@ interpreter), with a small web front end:
 | maple keyboard / mouse | canvas key/mouse events → `qemu_canvas_input()` |
 | `ttySC1` (2nd `-serial`, stdio) | xterm.js via the TTY in `dcweb-lib.js` |
 | BBA (rtl8139) | slirp user networking (DHCP, no internet from a browser) |
-| GD-ROM | `.cdi`/`.iso` fetched into MEMFS |
+| GD-ROM | `.cdi`/`.iso` streamed on demand (`block/wasm-http.c`), or a local file copied into MEMFS |
 
 ## Build
 
@@ -24,8 +24,24 @@ contrib/dreamcast-web/serve.py          # http://127.0.0.1:8086/
 
 `build.sh` configures `build-wasm/` once (sh4-softmmu, `--cpu=wasm64
 --wasm64-32bit-address-limit`, TCI, static slirp subproject), links
-`dcweb-lib.js`, and assembles `build-wasm/web/`. The disc is copied to
-`web/disc.cdi`. Without one the page asks for a local file.
+`dcweb-lib.js`, and assembles `build-wasm/web/`. The disc is symlinked as
+`web/disc.cdi` (use `rsync -L` to deploy). Without one the page asks for a
+local file.
+
+## Disc streaming
+
+A disc given by URL (`web/disc.cdi`, or `?disc=<url>`) is not downloaded up
+front. `block/wasm-http.c`, an http(s) block protocol compiled only into
+Emscripten builds, fetches 256 KiB chunks with synchronous Range requests
+from QEMU's worker threads as the GD-ROM reads them. When access is
+sequential it fetches up to 4 chunks per request. Chunks stay in an in-memory
+cache (default 512 MiB, oldest evicted first; `?cache=<MiB>`). The full
+803 MB `linux-7.3.1-with-userland-muslX.cdi` boots to the mksh prompt in about
+60 s after at most about 32 MB of fetches.
+
+The server must answer HEAD with `Accept-Ranges: bytes` and honour
+single-range requests (`serve.py`, nginx and GitHub Pages do). Otherwise
+the page falls back to a full download. So does `?preload`.
 
 ## Serving
 
@@ -35,8 +51,8 @@ with `Cross-Origin-Opener-Policy: same-origin` and
 that can't set headers (e.g. GitHub Pages) need a service-worker shim such as
 coi-serviceworker.
 
-URL parameters: `?disc=<url>`, `?nic=none`, `?nolcd`, `?tb=<MiB>` (TB cache,
-default 64), `?args=<extra qemu args>`.
+URL parameters: `?disc=<url>`, `?preload`, `?cache=<MiB>`, `?nic=none`,
+`?nolcd`, `?tb=<MiB>` (TB cache, default 64), `?args=<extra qemu args>`.
 
 ## Notes / gotchas
 
@@ -52,5 +68,10 @@ default 64), `?args=<extra qemu args>`.
   and found via `-L /rom`.
 - The guest draws the VMU LCD rotated (as it sits in a controller); the page
   rotates the canvas 180°.
-- Big discs (the 700+ MiB userland CDIs) don't fit the MEMFS approach well.
-  They need a lazy, HTTP-range-backed block device.
+- `EM_JS` hands 64-bit C pointers to JS as BigInt (`EM_ASM` converts them);
+  `wasm-http.c` wraps them in `Number()`.
+- The maple keyboard reports key state once per VSYNC, so `wasm-canvas.c`
+  spaces key events at least 40 ms apart. Otherwise a press and release
+  between two polls are lost.
+- Fetched chunks aren't kept across page loads yet. A persistent cache in
+  OPFS or IndexedDB would be the next step.

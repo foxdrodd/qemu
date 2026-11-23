@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/notify.h"
+#include "qemu/timer.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/surface.h"
@@ -31,6 +32,12 @@
 #define WC_MAX_CONSOLES 4
 #define WC_RING         512          /* power of two */
 #define WC_REFRESH_MS   16
+/*
+ * The maple keyboard reports key *state* once per VSYNC poll, so a press and
+ * its release landing between two polls would be lost.  Keep every key-state
+ * change visible for more than two frames.
+ */
+#define WC_KEY_GAP_MS   40
 
 enum {
     WC_EV_KEY = 1,                   /* a = linux keycode, b = down */
@@ -74,8 +81,10 @@ int qemu_canvas_input(int type, int a, int b)
 
 static void wc_drain_input(void)
 {
+    static int64_t last_key_ms = -WC_KEY_GAP_MS;
     uint32_t tail = __atomic_load_n(&ring_tail, __ATOMIC_RELAXED);
     uint32_t head = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE);
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     bool pointer = false;
     static const InputButton btns[] = {
         INPUT_BUTTON_LEFT, INPUT_BUTTON_MIDDLE, INPUT_BUTTON_RIGHT,
@@ -84,6 +93,12 @@ static void wc_drain_input(void)
     for (; tail != head; tail++) {
         WcEvent *ev = &ring[tail % WC_RING];
 
+        if (ev->type == WC_EV_KEY) {
+            if (now - last_key_ms < WC_KEY_GAP_MS) {
+                break;          /* leave the rest queued for a later tick */
+            }
+            last_key_ms = now;
+        }
         switch (ev->type) {
         case WC_EV_KEY:
             qemu_input_event_send_key_linux(NULL, ev->a, ev->b);
