@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dreamcast Linux</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --line: #262c34;
+    --fg: #d7dde4;
+    --muted: #8b95a1;
+    --accent: #f08a24;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  #status { color: var(--muted); font-size: 13px; flex: 1; min-width: 200px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px; padding: 16px; align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px; min-width: 0; }
+  .panel h2 { margin: 0 0 8px; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .panel h2 label { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  #screen { display: block; width: 100%; aspect-ratio: 4 / 3; background: #000;
+    image-rendering: pixelated; outline: none; cursor: pointer; }
+  #screen:focus { box-shadow: 0 0 0 2px var(--accent); }
+  #lcdwrap { margin-top: 10px; display: flex; align-items: center; gap: 12px;
+    color: var(--muted); font-size: 12px; }
+  /* The guest draws the VMU panel rotated, as it sits in a controller. */
+  #lcd { width: 144px; height: 96px; background: #000; image-rendering: pixelated;
+    border-radius: 4px; transform: rotate(180deg); }
+  #terminal { height: 520px; }
+  #picker { margin-top: 10px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px;
+    font-size: 11px; background: var(--bg); }
+</style>
+</head>
+<body data-disc="disc.cdi">
+<header>
+  <h1>Dreamcast <span>Linux</span> in the browser</h1>
+  <div id="status">Loading…</div>
+</header>
+<main>
+  <section class="panel">
+    <h2>PowerVR2 framebuffer
+      <label><input type="checkbox" id="grab"> capture mouse on click</label></h2>
+    <canvas id="screen" width="640" height="480"></canvas>
+    <div id="lcdwrap"><canvas id="lcd" width="48" height="32" hidden></canvas>
+      <span>VMU LCD</span></div>
+    <p class="hint">Click the screen to type on the maple keyboard.
+      <kbd>Esc</kbd> releases a captured mouse.</p>
+    <div id="picker" hidden>
+      <input type="file" id="discfile" accept=".cdi,.iso">
+    </div>
+  </section>
+  <section class="panel">
+    <h2>Serial console (ttySC1)</h2>
+    <div id="terminal"></div>
+    <p class="hint">Emulated by QEMU (TCG interpreter) compiled to WebAssembly.
+      Expect it to run several times slower than real hardware.</p>
+  </section>
+</main>
+<script src="vendor/xterm.js"></script>
+<script type="module" src="dcweb.js"></script>
+</body>
+</html>

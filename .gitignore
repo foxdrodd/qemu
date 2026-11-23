@@ -1,5 +1,6 @@
 /GNUmakefile
 /build/
+/build-wasm/
 /.cache/
 /.vscode/
 *.pyc
