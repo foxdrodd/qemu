@@ -195,8 +195,18 @@ static int coroutine_fn wh_co_preadv(BlockDriverState *bs, int64_t offset,
     size_t done = 0;
     int ret = 0;
 
-    if (offset < 0 || offset + bytes > s->len) {
+    if (offset < 0) {
         return -EIO;
+    }
+    /*
+     * The block layer works on 512-byte sectors and rounds the length up,
+     * so reads may run up to 511 bytes past EOF: those read as zeroes.
+     */
+    if (offset + bytes > s->len) {
+        int64_t tail = offset + bytes - MAX(offset, s->len);
+
+        qemu_iovec_memset(qiov, bytes - tail, 0, tail);
+        bytes -= tail;
     }
     qemu_mutex_lock(&s->lock);
     while (bytes > 0) {

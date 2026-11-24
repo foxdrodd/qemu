@@ -24,7 +24,22 @@ contrib/dreamcast-web/serve.py          # http://127.0.0.1:8086/
 
 `build.sh` configures `build-wasm/` once (sh4-softmmu, `--cpu=wasm64
 --wasm64-32bit-address-limit`, TCI, static slirp subproject), links
-`dcweb-lib.js`, and assembles `build-wasm/web/`. The disc is symlinked as
+`dcweb-lib.js`, and assembles `build-wasm/web/`.
+
+Optimization flags (`WASM_CFLAGS`, `WASM_LDFLAGS`, `WASM_LTO` override them).
+Measured on the busybox CDI with a 20k-iteration shell loop:
+
+| flags | boot | shell loop | .wasm |
+|---|---|---|---|
+| none (meson -O2 -g, no link -O) | 35.4 s | 87.8 s | 28.0 MB |
+| link `-O3` | 20.4 s | 45.1 s | 14.6 MB |
+| + compile `-O3 -g0` | 21.0 s | 43.2 s | 14.7 MB |
+| + `-fno-stack-protector`, `-sMALLOC=mimalloc` (**default**) | 19.3 s | 41.1 s | 14.7 MB |
+| + LTO | 21.2 s | 44.5 s | 16.9 MB |
+
+Link-time `-O3` matters most: without it `wasm-opt` never optimizes the
+Asyncify-instrumented code. `-msimd128` can't be used, because Binaryen's
+memory64 lowering rejects SIMD lane/splat loads. The disc is symlinked as
 `web/disc.cdi` (use `rsync -L` to deploy). Without one the page asks for a
 local file.
 
@@ -37,7 +52,7 @@ from QEMU's worker threads as the GD-ROM reads them. When access is
 sequential it fetches up to 4 chunks per request. Chunks stay in an in-memory
 cache (default 512 MiB, oldest evicted first; `?cache=<MiB>`). The full
 803 MB `linux-7.3.1-with-userland-muslX.cdi` boots to the mksh prompt in about
-60 s after at most about 32 MB of fetches.
+30 s after at most about 32 MB of fetches.
 
 The server must answer HEAD with `Accept-Ranges: bytes` and honour
 single-range requests (`serve.py`, nginx and GitHub Pages do). Otherwise

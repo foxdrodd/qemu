@@ -15,6 +15,14 @@ BUILD="$SRC/build-wasm"
 OUT="$BUILD/web"
 IMAGE=${IMAGE:-qemu-emsdk-wasm}
 JOBS=${JOBS:-12}
+# Extra compile / link flags on top of configs/meson/emscripten.txt.
+# Measured (busybox CDI, shell-loop benchmark, Chromium): link-time -O3 is the
+# big one (~1.9x: it lets wasm-opt clean up after the Asyncify transform);
+# compile -O3 -g0, no stack protector and mimalloc add ~10%.  -msimd128 breaks
+# wasm-opt's memory64 lowering; LTO was slightly slower and bigger.
+WASM_CFLAGS=${WASM_CFLAGS--O3 -g0 -fno-stack-protector}
+WASM_LDFLAGS=${WASM_LDFLAGS--O3 -sMALLOC=mimalloc}
+WASM_LTO=${WASM_LTO:-false}
 DISC=${1:-}
 
 mkdir -p "$BUILD"
@@ -26,21 +34,26 @@ mkdir -p "$BUILD"
 # with "meson configure" instead (its list plus our JS library).  libslirp
 # comes from the bundled subproject and wasm can only link it statically,
 # which configure has no switch for.
-docker run --rm -v "$SRC:$SRC" -w "$BUILD" -e JOBS="$JOBS" "$IMAGE" sh -ec "
+docker run --rm -v "$SRC:$SRC" -w "$BUILD" -e JOBS="$JOBS" \
+    -e WASM_CFLAGS="$WASM_CFLAGS" -e WASM_LDFLAGS="$WASM_LDFLAGS" -e WASM_LTO="$WASM_LTO" "$IMAGE" sh -ec "
   trap 'chown -R $(id -u):$(id -g) $BUILD' EXIT
   if [ ! -f build.ninja ]; then
     emconfigure ../configure --static --cpu=wasm64 --wasm64-32bit-address-limit \
       --target-list=sh4-softmmu --disable-tools --disable-docs \
       --enable-tcg-interpreter --disable-fdt --disable-slirp
   fi
-  LINK=\$(python3 -c \"
-import configparser
+  eval \$(python3 -c \"
+import configparser, shlex
 c = configparser.ConfigParser()
 c.read('../configs/meson/emscripten.txt')
-args = eval(c['built-in options']['c_link_args'])
-args.append('--js-library=$WEB_SRC/dcweb-lib.js')
-print(repr(args))\")
+opts = c['built-in options']
+cargs = eval(opts['c_args']) + shlex.split('\$WASM_CFLAGS')
+link = eval(opts['c_link_args']) + shlex.split('\$WASM_LDFLAGS')
+link.append('--js-library=$WEB_SRC/dcweb-lib.js')
+print('CARGS=' + shlex.quote(repr(cargs)) + ' LINK=' + shlex.quote(repr(link)))\")
   pyvenv/bin/meson configure -Ddefault_library=static -Dslirp=enabled \\
+    -Db_lto=\$WASM_LTO \\
+    -Dc_args=\"\$CARGS\" -Dcpp_args=\"\$CARGS\" \\
     -Dc_link_args=\"\$LINK\" -Dcpp_link_args=\"\$LINK\" . >/dev/null
   ninja -j\$JOBS qemu-system-sh4.js
 "
