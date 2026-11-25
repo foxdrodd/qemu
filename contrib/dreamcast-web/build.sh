@@ -66,6 +66,9 @@ print('CARGS=' + shlex.quote(repr(cargs)) + ' LINK=' + shlex.quote(repr(link)))\
 
 mkdir -p "$OUT"
 cp "$BUILD/qemu-system-sh4.js" "$BUILD/qemu-system-sh4.wasm" "$OUT/"
+# Precompressed copies (15 MB -> 4.5 MB for the .wasm): serve.py and
+# nginx's "gzip_static on" send them with Content-Encoding: gzip.
+gzip -9 -k -f -n "$OUT/qemu-system-sh4.wasm" "$OUT/qemu-system-sh4.js"
 cp "$WEB_SRC/index.html" "$WEB_SRC/dcweb.js" "$WEB_SRC/keymap.js" "$OUT/"
 cp -r "$WEB_SRC/vendor" "$OUT/"
 # Option ROM the rtl8139 (BBA) device insists on loading.

@@ -86,7 +86,11 @@ interpreter lacks the TCI changes above.
 Link-time `-O3` matters most: without it `wasm-opt` never optimizes the
 Asyncify-instrumented code. `-msimd128` can't be used, because Binaryen's
 memory64 lowering rejects SIMD lane/splat loads. The disc is symlinked as
-`web/disc.cdi` (use `rsync -L` to deploy). Without one the page asks for a
+`web/disc.cdi` (use `rsync -L` to deploy). `build.sh` also writes
+`qemu-system-sh4.{wasm,js}.gz` (the .wasm goes from 15 MB to 4.5 MB):
+`serve.py` sends them with `Content-Encoding: gzip`, and on nginx
+`gzip_static on;` does the same. That is most of the page's load time
+on a slow connection. Without one the page asks for a
 local file.
 
 ## Disc streaming

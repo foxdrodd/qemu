@@ -2,6 +2,8 @@
 """Serve build-wasm/web with the cross-origin isolation headers that
 SharedArrayBuffer (and therefore Emscripten pthreads) requires, and with
 HTTP Range support (single byte ranges), which the lazy disc loader needs.
+A .wasm or .js with an up-to-date .gz next to it (build.sh writes them) is
+sent gzip-encoded, like nginx's "gzip_static on".
 
     contrib/dreamcast-web/serve.py [--port 8086] [--bind 127.0.0.1] [dir]
 """
@@ -23,11 +25,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     }
 
     _remaining = None
+    GZ_TYPES = (".wasm", ".js")
+
+    def send_gzipped(self, path):
+        """Send path's precompressed .gz sibling, or return None."""
+        gz = path + ".gz"
+        if (not path.endswith(self.GZ_TYPES) or not os.path.isfile(gz)
+                or "gzip" not in self.headers.get("Accept-Encoding", "")
+                or os.path.getmtime(gz) < os.path.getmtime(path)):
+            return None
+        f = open(gz, "rb")
+        self.send_response(200)
+        self.send_header("Content-Type", self.guess_type(path))
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(os.fstat(f.fileno()).st_size))
+        self.send_header("Vary", "Accept-Encoding")
+        self.end_headers()
+        return f
 
     def send_head(self):
         self._remaining = None
         rng = self.headers.get("Range")
         path = self.translate_path(self.path)
+        if not rng and os.path.isfile(path):
+            f = self.send_gzipped(path)
+            if f:
+                return f
         if not rng or not os.path.isfile(path):
             return super().send_head()
         m = re.fullmatch(r"\s*bytes=(\d*)-(\d*)\s*", rng)
