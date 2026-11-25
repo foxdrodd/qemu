@@ -7,6 +7,7 @@ ARG GLIB_VERSION=${GLIB_MINOR_VERSION}.0
 ARG PIXMAN_VERSION=0.44.2
 ARG FFI_VERSION=v3.5.2
 ARG MESON_VERSION=1.5.0
+ARG ZSTD_VERSION=1.5.7
 
 FROM docker.io/emscripten/emsdk:$EMSDK_VERSION_QEMU AS build-base-common
 ARG MESON_VERSION
@@ -147,6 +148,17 @@ RUN sed -i -E "/#define HAVE_POSIX_SPAWN 1/d" ./_build/config.h
 RUN sed -i -E "/#define HAVE_PTHREAD_GETNAME_NP 1/d" ./_build/config.h
 RUN meson install -C _build
 
+# zstd: lets QEMU (and the dreamcast-web disc streamer) read zstd data.
+FROM build-base AS zstd-dev
+ARG ZSTD_VERSION
+RUN mkdir -p /zstd
+RUN curl -Ls https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz | \
+    tar xzC /zstd --strip-components=1
+WORKDIR /zstd
+RUN emmake make -C lib -j$(nproc) libzstd.a
+RUN emmake make -C lib install-static install-pc install-includes PREFIX=$TARGET
+
 FROM build-base-common
 COPY --from=glib-dev /builddeps/ /builddeps/
 COPY --from=pixman-dev /builddeps/ /builddeps/
+COPY --from=zstd-dev /builddeps/ /builddeps/

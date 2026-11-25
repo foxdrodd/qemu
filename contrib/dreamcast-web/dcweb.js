@@ -138,26 +138,39 @@ async function main() {
 
   // A disc given by URL is streamed: QEMU's wasm-http block driver fetches
   // chunks with Range requests as the guest reads them.  A locally picked
-  // file (or ?preload) is copied into MEMFS in full instead.
+  // file (or ?preload) is copied into MEMFS in full instead.  A .zst disc
+  // (zstd seekable format, see zstd-seekable.py) can only be streamed: the
+  // driver decompresses it frame by frame.
+  // data-disc lists candidates; the first one the server has is used.
   let disc;
-  const discUrl = params.get("disc") || document.body.dataset.disc;
-  if (discUrl) {
+  const discUrls = params.has("disc") ? [params.get("disc")]
+    : (document.body.dataset.disc || "").split(/\s+/).filter(Boolean);
+  let lastErr = null;
+  for (const discUrl of discUrls) {
     const abs = new URL(discUrl, location.href).href;
     try {
       const head = await fetch(abs, { method: "HEAD" });
       if (!head.ok) throw new Error(`HTTP ${head.status}`);
       const size = +head.headers.get("Content-Length") || 0;
       const ranges = /bytes/i.test(head.headers.get("Accept-Ranges") || "");
-      if (ranges && !params.has("preload")) {
+      const zst = /\.zst$/i.test(discUrl);
+      if (zst && !ranges) {
+        throw new Error("a .zst disc needs a server with Range support");
+      }
+      if (zst || (ranges && !params.has("preload"))) {
         disc = { name: discUrl, url: abs, size };
       } else {
         disc = { name: discUrl, data: await fetchDisc(abs) };
       }
+      break;
     } catch (e) {
-      status(`Could not load ${discUrl} (${e.message}); pick a disc image.`);
-      disc = await pickLocalDisc();
+      lastErr = `Could not load ${discUrl} (${e.message})`;
     }
-  } else {
+  }
+  if (!disc && lastErr) {
+    status(`${lastErr}; pick a disc image.`);
+    disc = await pickLocalDisc();
+  } else if (!disc) {
     status("Pick a Dreamcast disc image (.cdi or .iso).");
     disc = await pickLocalDisc();
   }

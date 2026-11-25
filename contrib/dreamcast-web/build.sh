@@ -2,11 +2,12 @@
 # Build qemu-system-sh4 (with -M dreamcast) for the browser and assemble a
 # servable web directory.
 #
-#   contrib/dreamcast-web/build.sh [disc.cdi|disc.iso]   (symlinked as web/disc.*)
+#   contrib/dreamcast-web/build.sh [disc.cdi|disc.iso|disc.cdi.zst]
+#   (the disc is symlinked as web/disc.*; .zst must be in the zstd seekable
+#   format, see zstd-seekable.py)
 #
-# Needs the "qemu-emsdk-wasm" image, built from
-# tests/docker/dockerfiles/emsdk-wasm64-cross.docker (zlib URL fixed to the
-# GitHub release tarball).  Output: build-wasm/web/  (serve with serve.py).
+# Needs the "qemu-emsdk-wasm" image, built from emsdk-wasm.docker here (see
+# README.md).  Output: build-wasm/web/  (serve with serve.py).
 set -e
 
 SRC=$(cd "$(dirname "$0")/../.." && pwd)
@@ -53,6 +54,7 @@ link.append('--js-library=$WEB_SRC/dcweb-lib.js')
 print('CARGS=' + shlex.quote(repr(cargs)) + ' LINK=' + shlex.quote(repr(link)))\")
   pyvenv/bin/meson configure -Ddefault_library=static -Dslirp=enabled \\
     -Db_lto=\$WASM_LTO \\
+    -Dzstd=enabled \\
     -Dc_args=\"\$CARGS\" -Dcpp_args=\"\$CARGS\" \\
     -Dc_link_args=\"\$LINK\" -Dcpp_link_args=\"\$LINK\" . >/dev/null
   ninja -j\$JOBS qemu-system-sh4.js
@@ -68,7 +70,12 @@ cp "$SRC/pc-bios/efi-rtl8139.rom" "$OUT/rom/"
 if [ -n "$DISC" ]; then
   # Symlinked, not copied: the page streams it with Range requests, so the
   # 700+ MiB userland discs are fine.  (Use rsync -L to deploy elsewhere.)
-  rm -f "$OUT"/disc.cdi "$OUT"/disc.iso
-  ln -s "$(realpath "$DISC")" "$OUT/disc.${DISC##*.}"
+  rm -f "$OUT"/disc.cdi "$OUT"/disc.iso "$OUT"/disc.cdi.zst "$OUT"/disc.iso.zst
+  case "$DISC" in
+    *.iso.zst) name=disc.iso.zst ;;
+    *.zst) name=disc.cdi.zst ;;
+    *) name=disc.${DISC##*.} ;;
+  esac
+  ln -s "$(realpath "$DISC")" "$OUT/$name"
 fi
 ls -la "$OUT"

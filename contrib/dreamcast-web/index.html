@@ -31,8 +31,10 @@
     text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
     display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   .panel h2 label { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  /* Smooth scaling: nearest-neighbour at the usual fractional scale factors
+     (~1.45x) gives uneven glyph strokes. */
   #screen { display: block; width: 100%; aspect-ratio: 4 / 3; background: #000;
-    image-rendering: pixelated; outline: none; cursor: pointer; }
+    image-rendering: auto; outline: none; cursor: pointer; }
   #screen:focus { box-shadow: 0 0 0 2px var(--accent); }
   #lcdwrap { margin-top: 10px; display: flex; align-items: center; gap: 12px;
     color: var(--muted); font-size: 12px; }
@@ -46,7 +48,7 @@
     font-size: 11px; background: var(--bg); }
 </style>
 </head>
-<body data-disc="disc.cdi">
+<body data-disc="disc.cdi.zst disc.cdi disc.iso">
 <header>
   <h1>Dreamcast <span>Linux</span> in the browser</h1>
   <div id="status">Loading…</div>

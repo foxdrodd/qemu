@@ -9,13 +9,13 @@ interpreter), with a small web front end:
 | maple keyboard / mouse | canvas key/mouse events → `qemu_canvas_input()` |
 | `ttySC1` (2nd `-serial`, stdio) | xterm.js via the TTY in `dcweb-lib.js` |
 | BBA (rtl8139) | slirp user networking (DHCP, no internet from a browser) |
-| GD-ROM | `.cdi`/`.iso` streamed on demand (`block/wasm-http.c`), or a local file copied into MEMFS |
+| GD-ROM | `.cdi`/`.iso` (or seekable `.cdi.zst`) streamed on demand (`block/wasm-http.c`), or a local file copied into MEMFS |
 
 ## Build
 
 ```sh
 # once: the emsdk build image (= tests/docker/dockerfiles/emsdk-wasm64-cross.docker
-# with the stale zlib.net URL replaced by the GitHub release tarball)
+# with the stale zlib.net URL replaced by the GitHub release tarball, plus zstd)
 docker build -t qemu-emsdk-wasm -f contrib/dreamcast-web/emsdk-wasm.docker contrib/dreamcast-web
 
 contrib/dreamcast-web/build.sh /path/to/linux-7.3.1-base-busybox.cdi
@@ -57,6 +57,26 @@ cache (default 512 MiB, oldest evicted first; `?cache=<MiB>`). The full
 The server must answer HEAD with `Accept-Ranges: bytes` and honour
 single-range requests (`serve.py`, nginx and GitHub Pages do). Otherwise
 the page falls back to a full download. So does `?preload`.
+
+### Compressed discs
+
+A disc in the zstd *seekable* format is streamed compressed: the driver
+spots the seek table at the end of the file, fetches frames by their
+compressed byte range and decompresses them with libzstd (one frame = one
+chunk, so all frames but the last must have the same size). Make one with
+
+```sh
+contrib/dreamcast-web/zstd-seekable.py linux-7.3.1-with-userland-muslX.cdi \
+    linux-7.3.1-with-userland-muslX.cdi.zst      # 256 KiB frames, level 19
+```
+
+It is still a normal `.zst` (`zstd -d` unpacks it and skips the table). A
+plain `zstd` stream has no random access; the driver refuses it with a
+hint to recompress. For muslX: 803 MB → 400 MB (plain
+`zstd -3` gives 409 MB), and the boot to a shell fetches 6.4 MiB instead
+of about 20 MiB, with no measurable CPU cost. The page tries
+`disc.cdi.zst`, `disc.cdi`, `disc.iso` in that order; `.zst` discs are
+always streamed (`?preload` is ignored for them).
 
 ## Serving
 

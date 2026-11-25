@@ -103,7 +103,7 @@ endif
 block_ss.add(when: libaio, if_true: files('linux-aio.c'))
 block_ss.add(when: linux_io_uring, if_true: files('io_uring.c'))
 if host_os == 'emscripten'
-  block_ss.add(files('wasm-http.c'))
+  block_ss.add(files('wasm-http.c'), zstd)
 endif
 
 block_modules = {}
