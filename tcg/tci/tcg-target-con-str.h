@@ -9,3 +9,4 @@
  * REGS(letter, register_mask)
  */
 REGS('r', MAKE_64BIT_MASK(0, TCG_TARGET_NB_REGS))
+CONST('I', TCG_CT_CONST_S16)

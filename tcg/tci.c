@@ -119,12 +119,38 @@ static void tci_args_ri(uint32_t insn, TCGReg *r0, tcg_target_ulong *i1)
     *i1 = sextract32(insn, 12, 20);
 }
 
-static void tci_args_rrm(uint32_t insn, TCGReg *r0,
-                         TCGReg *r1, MemOpIdx *m2)
+/* qemu_ld/st: data and address registers, MemOpIdx in the next word. */
+static void tci_args_rrw(uint32_t insn, const uint32_t **tb_ptr,
+                         TCGReg *r0, TCGReg *r1, uint64_t *taddr,
+                         const tcg_target_ulong *regs, MemOpIdx *m2)
 {
     *r0 = extract32(insn, 8, 4);
     *r1 = extract32(insn, 12, 4);
-    *m2 = extract32(insn, 16, 16);
+    *taddr = extract32(insn, 16, 1) ? (uint32_t)regs[*r1] : regs[*r1];
+    *m2 = *(*tb_ptr)++;
+}
+
+static void tci_args_rrc(uint32_t insn, TCGReg *r0, TCGReg *r1, TCGCond *c2)
+{
+    *r0 = extract32(insn, 8, 4);
+    *r1 = extract32(insn, 12, 4);
+    *c2 = extract32(insn, 16, 4);
+}
+
+static void tci_args_rci(uint32_t insn, TCGReg *r0, TCGCond *c1,
+                         tcg_target_ulong *i2)
+{
+    *r0 = extract32(insn, 8, 4);
+    *c1 = extract32(insn, 12, 4);
+    *i2 = sextract32(insn, 16, 16);
+}
+
+/* Store of a constant: base register and offset, value in the next word. */
+static void *tci_args_sti(uint32_t insn, const uint32_t **tb_ptr,
+                          const tcg_target_ulong *regs, tcg_target_ulong *val)
+{
+    *val = (int32_t)*(*tb_ptr)++;
+    return (void *)(regs[extract32(insn, 8, 4)] + sextract32(insn, 16, 16));
 }
 
 static void tci_args_rrr(uint32_t insn, TCGReg *r0, TCGReg *r1, TCGReg *r2)
@@ -589,12 +615,32 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             ptr = (void *)(regs[r1] + ofs);
             *(tcg_target_ulong *)ptr = regs[r0];
             break;
+        case INDEX_op_tci_st8i:
+            ptr = tci_args_sti(insn, &tb_ptr, regs, &t1);
+            *(uint8_t *)ptr = t1;
+            break;
+        case INDEX_op_tci_st16i:
+            ptr = tci_args_sti(insn, &tb_ptr, regs, &t1);
+            *(uint16_t *)ptr = t1;
+            break;
+        case INDEX_op_tci_st32i:
+            ptr = tci_args_sti(insn, &tb_ptr, regs, &t1);
+            *(uint32_t *)ptr = t1;
+            break;
+        case INDEX_op_tci_sti:
+            ptr = tci_args_sti(insn, &tb_ptr, regs, &t1);
+            *(tcg_target_ulong *)ptr = t1;
+            break;
 
             /* Arithmetic operations (mixed 32/64 bit). */
 
         case INDEX_op_add:
             tci_args_rrr(insn, &r0, &r1, &r2);
             regs[r0] = regs[r1] + regs[r2];
+            break;
+        case INDEX_op_tci_addi:
+            tci_args_rrs(insn, &r0, &r1, &ofs);
+            regs[r0] = regs[r1] + ofs;
             break;
         case INDEX_op_sub:
             tci_args_rrr(insn, &r0, &r1, &r2);
@@ -771,9 +817,31 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             regs[r0] = sextract64(regs[r1], pos, len);
             break;
         case INDEX_op_brcond:
-            tci_args_rl(insn, tb_ptr, &r0, &ptr);
-            if (regs[r0]) {
-                tb_ptr = ptr;
+            tci_args_rrc(insn, &r0, &r1, &condition);
+            ofs = *tb_ptr++;
+            if (tci_compare64(regs[r0], regs[r1], condition)) {
+                tb_ptr = (const void *)tb_ptr + ofs;
+            }
+            break;
+        case INDEX_op_tci_brcond32:
+            tci_args_rrc(insn, &r0, &r1, &condition);
+            ofs = *tb_ptr++;
+            if (tci_compare32(regs[r0], regs[r1], condition)) {
+                tb_ptr = (const void *)tb_ptr + ofs;
+            }
+            break;
+        case INDEX_op_tci_brcondi:
+            tci_args_rci(insn, &r0, &condition, &t1);
+            ofs = *tb_ptr++;
+            if (tci_compare64(regs[r0], t1, condition)) {
+                tb_ptr = (const void *)tb_ptr + ofs;
+            }
+            break;
+        case INDEX_op_tci_brcondi32:
+            tci_args_rci(insn, &r0, &condition, &t1);
+            ofs = *tb_ptr++;
+            if (tci_compare32(regs[r0], t1, condition)) {
+                tb_ptr = (const void *)tb_ptr + ofs;
             }
             break;
         case INDEX_op_bswap16:
@@ -874,26 +942,12 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             break;
 
         case INDEX_op_qemu_ld:
-            tci_args_rrm(insn, &r0, &r1, &oi);
-            taddr = regs[r1];
-            regs[r0] = tci_qemu_ld(env, taddr, oi, tb_ptr);
-            break;
-        case INDEX_op_tci_qemu_ld_rrr:
-            tci_args_rrr(insn, &r0, &r1, &r2);
-            taddr = regs[r1];
-            oi = regs[r2];
+            tci_args_rrw(insn, &tb_ptr, &r0, &r1, &taddr, regs, &oi);
             regs[r0] = tci_qemu_ld(env, taddr, oi, tb_ptr);
             break;
 
         case INDEX_op_qemu_st:
-            tci_args_rrm(insn, &r0, &r1, &oi);
-            taddr = regs[r1];
-            tci_qemu_st(env, taddr, regs[r0], oi, tb_ptr);
-            break;
-        case INDEX_op_tci_qemu_st_rrr:
-            tci_args_rrr(insn, &r0, &r1, &r2);
-            taddr = regs[r1];
-            oi = regs[r2];
+            tci_args_rrw(insn, &tb_ptr, &r0, &r1, &taddr, regs, &oi);
             tci_qemu_st(env, taddr, regs[r0], oi, tb_ptr);
             break;
 
@@ -992,11 +1046,42 @@ int print_insn_tci(bfd_vma addr, disassemble_info *info)
         info->fprintf_func(info->stream, "%-12s  %d, %p", op_name, len, ptr);
         break;
 
-    case INDEX_op_brcond:
-        tci_args_rl(insn, tb_ptr, &r0, &ptr);
-        info->fprintf_func(info->stream, "%-12s  %s, 0, ne, %p",
-                           op_name, str_r(r0), ptr);
+    case INDEX_op_tci_brcondi:
+    case INDEX_op_tci_brcondi32:
+        r0 = extract32(insn, 8, 4);
+        c = extract32(insn, 12, 4);
+        i1 = sextract32(insn, 16, 16);
+        s2 = *tb_ptr++;
+        info->fprintf_func(info->stream, "%-12s  %s, %" PRId64 ", %s, %p",
+                           op_name, str_r(r0), (int64_t)i1, str_c(c),
+                           (const void *)tb_ptr + s2);
+        return 2 * sizeof(insn);
+
+    case INDEX_op_tci_addi:
+        tci_args_rrs(insn, &r0, &r1, &s2);
+        info->fprintf_func(info->stream, "%-12s  %s, %s, %d",
+                           op_name, str_r(r0), str_r(r1), s2);
         break;
+
+    case INDEX_op_tci_st8i:
+    case INDEX_op_tci_st16i:
+    case INDEX_op_tci_st32i:
+    case INDEX_op_tci_sti:
+        r1 = extract32(insn, 8, 4);
+        s2 = sextract32(insn, 16, 16);
+        i1 = (int32_t)*tb_ptr++;
+        info->fprintf_func(info->stream, "%-12s  %" PRId64 ", %s, %d",
+                           op_name, (int64_t)i1, str_r(r1), s2);
+        return 2 * sizeof(insn);
+
+    case INDEX_op_brcond:
+    case INDEX_op_tci_brcond32:
+        tci_args_rrc(insn, &r0, &r1, &c);
+        s2 = *tb_ptr++;
+        info->fprintf_func(info->stream, "%-12s  %s, %s, %s, %p",
+                           op_name, str_r(r0), str_r(r1), str_c(c),
+                           (const void *)tb_ptr + s2);
+        return 2 * sizeof(insn);
 
     case INDEX_op_setcond:
     case INDEX_op_tci_setcond32:
@@ -1122,17 +1207,13 @@ int print_insn_tci(bfd_vma addr, disassemble_info *info)
 
     case INDEX_op_qemu_ld:
     case INDEX_op_qemu_st:
-        tci_args_rrm(insn, &r0, &r1, &oi);
-        info->fprintf_func(info->stream, "%-12s  %s, %s, %x",
-                           op_name, str_r(r0), str_r(r1), oi);
-        break;
-
-    case INDEX_op_tci_qemu_ld_rrr:
-    case INDEX_op_tci_qemu_st_rrr:
-        tci_args_rrr(insn, &r0, &r1, &r2);
-        info->fprintf_func(info->stream, "%-12s  %s, %s, %s",
-                           op_name, str_r(r0), str_r(r1), str_r(r2));
-        break;
+        r0 = extract32(insn, 8, 4);
+        r1 = extract32(insn, 12, 4);
+        oi = *tb_ptr++;
+        info->fprintf_func(info->stream, "%-12s  %s, %s%s, %x",
+                           op_name, str_r(r0), str_r(r1),
+                           extract32(insn, 16, 1) ? " (a32)" : "", oi);
+        return 2 * sizeof(insn);
 
     case INDEX_op_qemu_ld2:
     case INDEX_op_qemu_st2:

@@ -116,6 +116,22 @@ static void gen_st_i64(TCGv_i64 v, TCGTemp *addr, MemOpIdx oi)
 
 static void tcg_gen_req_mo(TCGBar type)
 {
+#ifdef EMSCRIPTEN
+    /*
+     * The implicit barriers that order guest memory accesses are only
+     * needed when another vCPU may observe them.  tcg_gen_mb() keeps
+     * them for uniprocessor system emulation because of I/O threads,
+     * but in the browser build each one is a seq_cst atomic.fence
+     * (an mfence on x86) in front of every guest load and store.
+     * The machines built for the web are uniprocessor and their devices
+     * hand data to the guest through MMIO or interrupts, both of which
+     * synchronise through the BQL, so drop them unless the TB runs in
+     * parallel.  Explicit guest barriers still go through tcg_gen_mb().
+     */
+    if (!(tcg_ctx->gen_tb->cflags & CF_PARALLEL)) {
+        return;
+    }
+#endif
     type &= tcg_ctx->guest_mo;
     type &= ~TCG_TARGET_DEFAULT_MO;
     if (type) {
@@ -127,7 +143,9 @@ static TCGTemp *tci_extend_addr(TCGTemp *addr)
 {
 #ifdef CONFIG_TCG_INTERPRETER
     /*
-     * 64-bit interpreter requires 64-bit addresses.
+     * 64-bit interpreter requires 64-bit addresses for the 128-bit
+     * accesses; its qemu_ld/qemu_st zero-extend 32-bit addresses
+     * themselves, so the single loads and stores skip this.
      * Compare to the extension performed by tcg_out_{ld,st}_helper_args
      * for native code generation.
      */
@@ -244,7 +262,6 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
     MemOp orig_memop;
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
-    TCGTemp *addr_new;
 
     tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     orig_memop = memop = tcg_canonicalize_memop(memop, 0, 0);
@@ -259,9 +276,8 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
         oi = make_memop_idx(memop, idx);
     }
 
-    addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
-    gen_ldst1(INDEX_op_qemu_ld, TCG_TYPE_I32, tcgv_i32_temp(val), addr_new, oi);
+    gen_ldst1(INDEX_op_qemu_ld, TCG_TYPE_I32, tcgv_i32_temp(val), addr, oi);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
         switch (orig_memop & MO_SIZE) {
@@ -280,7 +296,6 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
 
     plugin_gen_mem_callbacks_i32(val, copy_addr, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_R);
-    maybe_free_addr(addr, addr_new);
 }
 
 void tcg_gen_qemu_ld_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
@@ -296,7 +311,6 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 orig_val, TCGTemp *addr,
 {
     TCGv_i32 val = orig_val;
     MemOpIdx orig_oi, oi;
-    TCGTemp *addr_new;
 
     tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     memop = tcg_canonicalize_memop(memop, 0, 1);
@@ -318,11 +332,9 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 orig_val, TCGTemp *addr,
         oi = make_memop_idx(memop, idx);
     }
 
-    addr_new = tci_extend_addr(addr);
-    gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I32, tcgv_i32_temp(val), addr_new, oi);
+    gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I32, tcgv_i32_temp(val), addr, oi);
     plugin_gen_mem_callbacks_i32(orig_val, NULL, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_W);
-    maybe_free_addr(addr, addr_new);
 
     if (val != orig_val) {
         tcg_temp_free_i32(val);
@@ -343,7 +355,6 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
     MemOp orig_memop;
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
-    TCGTemp *addr_new;
 
     tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
     orig_memop = memop = tcg_canonicalize_memop(memop, 1, 0);
@@ -358,9 +369,8 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
         oi = make_memop_idx(memop, idx);
     }
 
-    addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
-    gen_ld_i64(val, addr_new, oi);
+    gen_ld_i64(val, addr, oi);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
         int flags = (orig_memop & MO_SIGN
@@ -383,7 +393,6 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
 
     plugin_gen_mem_callbacks_i64(val, copy_addr, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_R);
-    maybe_free_addr(addr, addr_new);
 }
 
 void tcg_gen_qemu_ld_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
@@ -399,7 +408,6 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 orig_val, TCGTemp *addr,
 {
     TCGv_i64 val = orig_val;
     MemOpIdx orig_oi, oi;
-    TCGTemp *addr_new;
 
     tcg_gen_req_mo(TCG_MO_LD_ST | TCG_MO_ST_ST);
     memop = tcg_canonicalize_memop(memop, 1, 1);
@@ -424,11 +432,9 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 orig_val, TCGTemp *addr,
         oi = make_memop_idx(memop, idx);
     }
 
-    addr_new = tci_extend_addr(addr);
-    gen_st_i64(val, addr_new, oi);
+    gen_st_i64(val, addr, oi);
     plugin_gen_mem_callbacks_i64(orig_val, NULL, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_W);
-    maybe_free_addr(addr, addr_new);
 
     if (val != orig_val) {
         tcg_temp_free_i64(val);

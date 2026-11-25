@@ -87,14 +87,23 @@ static const char *const tcg_target_reg_names[TCG_TARGET_NB_REGS] = {
 };
 #endif
 
+/* A constant that fits the 16-bit immediate field of the tci_*i ops. */
+#define TCG_CT_CONST_S16  0x100
+
 static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
                         intptr_t value, intptr_t addend)
 {
     intptr_t diff = value - (intptr_t)(code_ptr + 1);
 
     tcg_debug_assert(addend == 0);
-    tcg_debug_assert(type == 20);
 
+    if (type == 32) {
+        /* A whole word following the insn (see tgen_brcond). */
+        tcg_debug_assert(diff == (int32_t)diff);
+        tcg_patch32(code_ptr, diff);
+        return true;
+    }
+    tcg_debug_assert(type == 20);
     if (diff == sextract32(diff, 0, type)) {
         tcg_patch32(code_ptr, deposit32(*code_ptr, 32 - type, type, diff));
         return true;
@@ -165,16 +174,6 @@ static void tcg_out_op_ri(TCGContext *s, TCGOpcode op, TCGReg r0, int32_t i1)
     tcg_out32(s, insn);
 }
 
-static void tcg_out_op_rl(TCGContext *s, TCGOpcode op, TCGReg r0, TCGLabel *l1)
-{
-    tcg_insn_unit insn = 0;
-
-    tcg_out_reloc(s, s->code_ptr, 20, l1, 0);
-    insn = deposit32(insn, 0, 8, op);
-    insn = deposit32(insn, 8, 4, r0);
-    tcg_out32(s, insn);
-}
-
 static void tcg_out_op_rr(TCGContext *s, TCGOpcode op, TCGReg r0, TCGReg r1)
 {
     tcg_insn_unit insn = 0;
@@ -182,19 +181,6 @@ static void tcg_out_op_rr(TCGContext *s, TCGOpcode op, TCGReg r0, TCGReg r1)
     insn = deposit32(insn, 0, 8, op);
     insn = deposit32(insn, 8, 4, r0);
     insn = deposit32(insn, 12, 4, r1);
-    tcg_out32(s, insn);
-}
-
-static void tcg_out_op_rrm(TCGContext *s, TCGOpcode op,
-                           TCGReg r0, TCGReg r1, TCGArg m2)
-{
-    tcg_insn_unit insn = 0;
-
-    tcg_debug_assert(m2 == extract32(m2, 0, 16));
-    insn = deposit32(insn, 0, 8, op);
-    insn = deposit32(insn, 8, 4, r0);
-    insn = deposit32(insn, 12, 4, r1);
-    insn = deposit32(insn, 16, 16, m2);
     tcg_out32(s, insn);
 }
 
@@ -484,9 +470,26 @@ static void tgen_add(TCGContext *s, TCGType type,
     tcg_out_op_rrr(s, INDEX_op_add, a0, a1, a2);
 }
 
+/*
+ * Constants would otherwise need a tci_movi of their own, i.e. a second
+ * dispatch; adding small ones is common enough to deserve its own insn.
+ */
+static void tgen_addi(TCGContext *s, TCGType type,
+                      TCGReg a0, TCGReg a1, tcg_target_long a2)
+{
+    tcg_insn_unit insn = 0;
+
+    insn = deposit32(insn, 0, 8, INDEX_op_tci_addi);
+    insn = deposit32(insn, 8, 4, a0);
+    insn = deposit32(insn, 12, 4, a1);
+    insn = deposit32(insn, 16, 16, a2);
+    tcg_out32(s, insn);
+}
+
 static const TCGOutOpBinary outop_add = {
-    .base.static_constraint = C_O1_I2(r, r, r),
+    .base.static_constraint = C_O1_I2(r, r, rI),
     .out_rrr = tgen_add,
+    .out_rri = tgen_addi,
 };
 
 static TCGConstraintSetIndex cset_addsubcarry(TCGType type, unsigned flags)
@@ -1005,16 +1008,48 @@ static const TCGOutOpSetcond outop_negsetcond = {
     .out_rrr = tgen_negsetcond,
 };
 
+/*
+ * Compare and branch in one insn: (op, r0, r1, cond), followed by a word
+ * holding the displacement.  Branches are frequent enough that saving the
+ * separate setcond dispatch is measurable.
+ */
 static void tgen_brcond(TCGContext *s, TCGType type, TCGCond cond,
                         TCGReg arg0, TCGReg arg1, TCGLabel *l)
 {
-    tgen_setcond(s, type, cond, TCG_REG_TMP, arg0, arg1);
-    tcg_out_op_rl(s, INDEX_op_brcond, TCG_REG_TMP, l);
+    tcg_insn_unit insn = 0;
+
+    insn = deposit32(insn, 0, 8, (type == TCG_TYPE_I32
+                                  ? INDEX_op_tci_brcond32
+                                  : INDEX_op_brcond));
+    insn = deposit32(insn, 8, 4, arg0);
+    insn = deposit32(insn, 12, 4, arg1);
+    insn = deposit32(insn, 16, 4, cond);
+    tcg_out32(s, insn);
+    tcg_out_reloc(s, s->code_ptr, 32, l, 0);
+    tcg_out32(s, 0);
+}
+
+/* The same against a 16-bit immediate: (op, r0, cond, imm), displacement. */
+static void tgen_brcondi(TCGContext *s, TCGType type, TCGCond cond,
+                         TCGReg arg0, tcg_target_long arg1, TCGLabel *l)
+{
+    tcg_insn_unit insn = 0;
+
+    insn = deposit32(insn, 0, 8, (type == TCG_TYPE_I32
+                                  ? INDEX_op_tci_brcondi32
+                                  : INDEX_op_tci_brcondi));
+    insn = deposit32(insn, 8, 4, arg0);
+    insn = deposit32(insn, 12, 4, cond);
+    insn = deposit32(insn, 16, 16, arg1);
+    tcg_out32(s, insn);
+    tcg_out_reloc(s, s->code_ptr, 32, l, 0);
+    tcg_out32(s, 0);
 }
 
 static const TCGOutOpBrcond outop_brcond = {
-    .base.static_constraint = C_O0_I2(r, r),
+    .base.static_constraint = C_O0_I2(r, rI),
     .out_rr = tgen_brcond,
+    .out_ri = tgen_brcondi,
 };
 
 static void tgen_movcond(TCGContext *s, TCGType type, TCGCond cond,
@@ -1108,15 +1143,46 @@ static const TCGOutOpLoad outop_ld32s = {
     .out = tgen_ld32s,
 };
 
+/*
+ * Store a constant: (op, base, offset), followed by a word holding the
+ * value, sign-extended for 64-bit stores.  Saves the tci_movi for the
+ * many constant stores into env (can_do_io, flags, synced globals).
+ */
+static void tcg_out_sti_op(TCGContext *s, TCGOpcode op, TCGOpcode op_r,
+                           tcg_target_long val, TCGReg base, intptr_t offset)
+{
+    tcg_insn_unit insn = 0;
+
+    stack_bounds_check(base, offset);
+    if (offset != sextract32(offset, 0, 16)
+        || (op == INDEX_op_tci_sti && val != (int32_t)val)) {
+        tcg_out_movi(s, TCG_TYPE_I64, TCG_REG_TMP, val);
+        tcg_out_ldst(s, op_r, TCG_REG_TMP, base, offset);
+        return;
+    }
+    insn = deposit32(insn, 0, 8, op);
+    insn = deposit32(insn, 8, 4, base);
+    insn = deposit32(insn, 16, 16, offset);
+    tcg_out32(s, insn);
+    tcg_out32(s, val);
+}
+
 static void tgen_st8(TCGContext *s, TCGType type, TCGReg data,
                      TCGReg base, ptrdiff_t offset)
 {
     tcg_out_ldst(s, INDEX_op_st8, data, base, offset);
 }
 
+static void tgen_st8i(TCGContext *s, TCGType type, tcg_target_long data,
+                      TCGReg base, ptrdiff_t offset)
+{
+    tcg_out_sti_op(s, INDEX_op_tci_st8i, INDEX_op_st8, data, base, offset);
+}
+
 static const TCGOutOpStore outop_st8 = {
-    .base.static_constraint = C_O0_I2(r, r),
+    .base.static_constraint = C_O0_I2(ri, r),
     .out_r = tgen_st8,
+    .out_i = tgen_st8i,
 };
 
 static void tgen_st16(TCGContext *s, TCGType type, TCGReg data,
@@ -1125,25 +1191,58 @@ static void tgen_st16(TCGContext *s, TCGType type, TCGReg data,
     tcg_out_ldst(s, INDEX_op_st16, data, base, offset);
 }
 
+static void tgen_st16i(TCGContext *s, TCGType type, tcg_target_long data,
+                       TCGReg base, ptrdiff_t offset)
+{
+    tcg_out_sti_op(s, INDEX_op_tci_st16i, INDEX_op_st16, data, base, offset);
+}
+
 static const TCGOutOpStore outop_st16 = {
-    .base.static_constraint = C_O0_I2(r, r),
+    .base.static_constraint = C_O0_I2(ri, r),
     .out_r = tgen_st16,
+    .out_i = tgen_st16i,
 };
 
+static void tgen_sti(TCGContext *s, TCGType type, tcg_target_long data,
+                     TCGReg base, ptrdiff_t offset)
+{
+    if (type == TCG_TYPE_I32) {
+        tcg_out_sti_op(s, INDEX_op_tci_st32i, INDEX_op_st32,
+                       data, base, offset);
+    } else {
+        tcg_out_sti_op(s, INDEX_op_tci_sti, INDEX_op_st, data, base, offset);
+    }
+}
+
 static const TCGOutOpStore outop_st = {
-    .base.static_constraint = C_O0_I2(r, r),
+    .base.static_constraint = C_O0_I2(ri, r),
     .out_r = tcg_out_st,
+    .out_i = tgen_sti,
 };
+
+/*
+ * Guest loads and stores: (op, data, addr, a32), followed by a word with
+ * the MemOpIdx, which rarely fits in 16 bits.  With a32 set the interpreter
+ * zero-extends a 32-bit guest address itself, so tcg-op-ldst.c does not
+ * emit a separate extension for it.
+ */
+static void tcg_out_qemu_ldst(TCGContext *s, TCGOpcode op, TCGReg data,
+                              TCGReg addr, MemOpIdx oi)
+{
+    tcg_insn_unit insn = 0;
+
+    insn = deposit32(insn, 0, 8, op);
+    insn = deposit32(insn, 8, 4, data);
+    insn = deposit32(insn, 12, 4, addr);
+    insn = deposit32(insn, 16, 1, s->addr_type == TCG_TYPE_I32);
+    tcg_out32(s, insn);
+    tcg_out32(s, oi);
+}
 
 static void tgen_qemu_ld(TCGContext *s, TCGType type, TCGReg data,
                          TCGReg addr, MemOpIdx oi)
 {
-    if (oi & ~0xffff) {
-        tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_TMP, oi);
-        tcg_out_op_rrr(s, INDEX_op_tci_qemu_ld_rrr, data, addr, TCG_REG_TMP);
-    } else {
-        tcg_out_op_rrm(s, INDEX_op_qemu_ld, data, addr, oi);
-    }
+    tcg_out_qemu_ldst(s, INDEX_op_qemu_ld, data, addr, oi);
 }
 
 static const TCGOutOpQemuLdSt outop_qemu_ld = {
@@ -1158,12 +1257,7 @@ static const TCGOutOpQemuLdSt2 outop_qemu_ld2 = {
 static void tgen_qemu_st(TCGContext *s, TCGType type, TCGReg data,
                          TCGReg addr, MemOpIdx oi)
 {
-    if (oi & ~0xffff) {
-        tcg_out_movi(s, TCG_TYPE_I32, TCG_REG_TMP, oi);
-        tcg_out_op_rrr(s, INDEX_op_tci_qemu_st_rrr, data, addr, TCG_REG_TMP);
-    } else {
-        tcg_out_op_rrm(s, INDEX_op_qemu_st, data, addr, oi);
-    }
+    tcg_out_qemu_ldst(s, INDEX_op_qemu_st, data, addr, oi);
 }
 
 static const TCGOutOpQemuLdSt outop_qemu_st = {
@@ -1189,14 +1283,21 @@ static void tcg_out_st(TCGContext *s, TCGType type, TCGReg val, TCGReg base,
 static inline bool tcg_out_sti(TCGContext *s, TCGType type, TCGArg val,
                                TCGReg base, intptr_t ofs)
 {
-    return false;
+    tgen_sti(s, type, val, base, ofs);
+    return true;
 }
 
 /* Test if a constant matches the constraint. */
 static bool tcg_target_const_match(int64_t val, int ct,
                                    TCGType type, TCGCond cond, int vece)
 {
-    return ct & TCG_CT_CONST;
+    if (ct & TCG_CT_CONST) {
+        return true;
+    }
+    if (type == TCG_TYPE_I32) {
+        val = (int32_t)val;
+    }
+    return (ct & TCG_CT_CONST_S16) && val == sextract64(val, 0, 16);
 }
 
 static void tcg_out_nop_fill(tcg_insn_unit *p, int count)

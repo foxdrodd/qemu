@@ -48,6 +48,7 @@ to the serial getty):
 | + no QEMU TLB flush on SH4 ITLB refill (`target/sh4/helper.c`) | 7.3 s | ~11.7 s |
 | + TLB-hit fast path for TCI loads/stores (`tcg/tci.c`) | 6.0 s | ~8.5 s |
 | + TCG execution path excluded from Asyncify (`asyncify-remove.json`) | 4.3 s | ~6.5 s |
+| + fewer TCI dispatches (`tcg/tci.c`, `tcg/tci/`, `tcg/tcg-op-ldst.c`) | 3.4 s | ~4.8 s |
 
 - QEMU requires MMIO to be the last insn of a TB. Otherwise
   `cpu_io_recompile()` exits via longjmp and re-executes the insn,
@@ -76,6 +77,22 @@ to the serial getty):
   left out of the transform (`-sASYNCIFY_REMOVE`). A coroutine switch
   inside `cpu_exec()` would now corrupt the stack, so
   `util/coroutine-wasm.c` aborts with a message instead.
+- Each TCI bytecode op costs a dispatch through the interpreter switch,
+  and guest code is dominated by short sequences. An opcode histogram
+  (shell loop, awk, process starts, `ls -lR`) showed three easy cuts:
+  - Every guest load and store was preceded by a memory barrier
+    (SH4's memory order is `TCG_MO_ALL`), which in Wasm is a seq_cst
+    `atomic.fence` (an `mfence` on x86). Uniprocessor TBs on Emscripten
+    now skip these implicit barriers. Devices hand data to the guest
+    through MMIO or interrupts, which synchronise via the BQL anyway.
+  - `qemu_ld`/`qemu_st` carry the MemOpIdx in a second word instead of
+    loading it with a `tci_movi`. They also zero-extend 32-bit guest
+    addresses themselves, so the separate `extract` is gone too.
+  - `brcond` compares and branches in one insn, against a register or a
+    16-bit immediate. `add` and stores into env take immediates.
+
+  The workload executes 32 % fewer ops. In the browser, muslX awk got 32 %
+  faster, `ls -lR` 24 % and process starts 19 %.
 
 The upstream Wasm TCG backend series (v4, Jan 2026; a JIT for hot TBs) was
 tried on this tree: boot 7.1 s and shell loop 10.5 s against 5.8 s and
