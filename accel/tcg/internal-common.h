@@ -137,6 +137,17 @@ void page_table_config_init(void);
 G_NORETURN void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr);
 #endif /* CONFIG_USER_ONLY */
 
+/*
+ * I/O instruction hints: guest PCs where cpu_io_recompile() fired, with the
+ * number of insns it had to re-execute (1, or 2 for a branch + delay slot).
+ * The translator ends TBs before such a PC and translates it as a TB of its
+ * own, so that the I/O happens as the last insn of a TB and no longer needs
+ * the recompile exit every time.  Purely a performance hint: a stale or
+ * wrong entry only makes a TB shorter.
+ */
+bool tb_io_hint_add(vaddr pc, unsigned n);
+unsigned tb_io_hint_lookup(vaddr pc);
+
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
 

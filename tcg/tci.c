@@ -25,6 +25,27 @@
 #include "tcg-has.h"
 #include <ffi.h>
 
+#ifdef TCI_DIRECT_CALL
+/*
+ * Call func with the arguments in stack[] (one 64-bit slot each) through a
+ * pointer of its exact type; the result goes to R0 like after libffi.
+ * Returns false for signatures that need libffi (Int128).
+ * Kept out of line: inlined, its ~770 call sites (each with Asyncify
+ * bookkeeping) bloat the interpreter loop and slow everything else down.
+ */
+static __attribute__((noinline)) bool tci_call_direct(uint32_t sig, void *func,
+                                          uint64_t *stack,
+                                          tcg_target_ulong *regs)
+{
+    switch (sig) {
+#include "tci-direct-call.c.inc"
+    default:
+        return false;
+    }
+    return true;
+}
+#endif
+
 
 /*
  * Enable TCI assertions only when debugging TCG (and without NDEBUG defined).
@@ -354,6 +375,14 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                 func = ((void **)ptr)[0];
                 cif = ((void **)ptr)[1];
 
+#ifdef TCI_DIRECT_CALL
+                /* Helper functions may need to access the "return address" */
+                tci_tb_ptr = (uintptr_t)tb_ptr;
+                if (tci_call_direct(((TCIHelperCif *)cif)->sig, func,
+                                    stack, regs)) {
+                    break;
+                }
+#endif
                 n = cif->nargs;
                 for (i = s = 0; i < n; ++i) {
                     ffi_type *t = cif->arg_types[i];

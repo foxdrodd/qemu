@@ -606,6 +606,15 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
      */
     cpu->cflags_next_tb = curr_cflags(cpu) | CF_MEMI_ONLY | CF_NOIRQ | n;
 
+    /*
+     * Remember the I/O insn and drop this TB: its retranslation ends right
+     * before it, so the next pass through here (a polling loop, say) runs
+     * without the recompile exit.
+     */
+    if (tb_io_hint_add(cpu->cc->get_pc(cpu), n)) {
+        tb_phys_invalidate(tb, -1);
+    }
+
     if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
         vaddr pc = cpu->cc->get_pc(cpu);
         if (qemu_log_in_addr_range(pc)) {

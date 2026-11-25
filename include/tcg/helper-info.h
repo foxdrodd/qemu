@@ -55,6 +55,28 @@ typedef struct TCGCallArgumentLoc {
     unsigned tmp_subindex       : 2;
 } TCGCallArgumentLoc;
 
+#ifdef CONFIG_TCG_INTERPRETER
+/*
+ * With TCI_DIRECT_CALL, the interpreter calls helpers through a function
+ * pointer of the exact type instead of libffi, where it can: on Emscripten
+ * libffi is JavaScript, and calls through it cost more than the helpers.
+ * TCI_SIG encodes the signature: return kind r (0 void, 1 32-bit, 2 64-bit),
+ * argument count n and the mask m of 64-bit arguments.  The generated cases
+ * are in tcg/tci-direct-call.c.inc.
+ */
+#if defined(EMSCRIPTEN) && TCG_TARGET_REG_BITS == 64
+#define TCI_DIRECT_CALL 1
+#endif
+#define TCI_SIG(r, n, m)    ((r) | (n) << 2 | (m) << 5)
+#define TCI_SIG_NONE        UINT32_MAX
+
+/* What TCGHelperInfo.cif points to. */
+typedef struct TCIHelperCif {
+    ffi_cif cif;                /* first: used as a plain ffi_cif * too */
+    uint32_t sig;               /* TCI_SIG(), or TCI_SIG_NONE */
+} TCIHelperCif;
+#endif
+
 struct TCGHelperInfo {
     void *func;
     const char *name;

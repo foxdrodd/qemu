@@ -103,6 +103,43 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
     }
 }
 
+#define TB_IO_HINTS 4096                /* power of two */
+
+typedef struct TBIOHint {
+    vaddr pc;
+    unsigned n;                         /* 0: empty */
+} TBIOHint;
+
+static TBIOHint tb_io_hints[TB_IO_HINTS];
+
+static TBIOHint *tb_io_hint_slot(vaddr pc)
+{
+    return &tb_io_hints[(pc ^ (pc >> 12)) / 2 % TB_IO_HINTS];
+}
+
+/* Returns true if the hint is new. */
+bool tb_io_hint_add(vaddr pc, unsigned n)
+{
+    TBIOHint *h = tb_io_hint_slot(pc);
+
+    if (qatomic_read(&h->n) == n && qatomic_read(&h->pc) == pc) {
+        return false;
+    }
+    /* Racing translators may see a torn entry: harmless, see above. */
+    qatomic_set(&h->n, 0);
+    qatomic_set(&h->pc, pc);
+    qatomic_set(&h->n, n);
+    return true;
+}
+
+unsigned tb_io_hint_lookup(vaddr pc)
+{
+    TBIOHint *h = tb_io_hint_slot(pc);
+    unsigned n = qatomic_read(&h->n);
+
+    return n && qatomic_read(&h->pc) == pc ? MIN(n, 2) : 0;
+}
+
 bool translator_is_same_page(const DisasContextBase *db, vaddr addr)
 {
     return ((addr ^ db->pc_first) & TARGET_PAGE_MASK) == 0;
@@ -127,6 +164,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     TCGOp *icount_start_insn;
     TCGOp *first_insn_start = NULL;
     bool plugin_enabled;
+    unsigned io_n;
 
     tcg_ctx->addr_type = addr_type;
 
@@ -137,6 +175,11 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->is_jmp = DISAS_NEXT;
     db->num_insns = 0;
     db->max_insns = *max_insns;
+    /* A known I/O insn (plus its branch) at the start gets a TB of its own. */
+    io_n = tb_io_hint_lookup(pc);
+    if (io_n && io_n < db->max_insns) {
+        db->max_insns = io_n;
+    }
     db->insn_start = NULL;
     db->fake_insn = false;
     db->host_addr[0] = host_pc;
@@ -198,6 +241,12 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
         if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
+            db->is_jmp = DISAS_TOO_MANY;
+            break;
+        }
+
+        /* Stop before a known I/O insn, see tb_io_hint_add(). */
+        if (tb_io_hint_lookup(db->pc_next)) {
             db->is_jmp = DISAS_TOO_MANY;
             break;
         }

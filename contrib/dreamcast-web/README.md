@@ -37,6 +37,25 @@ Measured on the busybox CDI with a 20k-iteration shell loop:
 | + `-fno-stack-protector`, `-sMALLOC=mimalloc` (**default**) | 19.3 s | 41.1 s | 14.7 MB |
 | + LTO | 21.2 s | 44.5 s | 16.9 MB |
 
+Two TCG changes on top (host-clock times, same benchmark; boot = page load
+to the serial getty):
+
+| | boot | shell loop |
+|---|---|---|
+| flags above | 19.0 s | 34.8 s |
+| + I/O insn hints (`accel/tcg/translator.c`) | ~15 s | ~29 s |
+| + direct TCI helper calls (`tcg/tci.c`) | 7.3 s | 17.6 s |
+
+- QEMU requires MMIO to be the last insn of a TB. Otherwise
+  `cpu_io_recompile()` exits via longjmp and re-executes the insn,
+  and Emscripten implements longjmp as a JS exception. Polling loops in the
+  guest kernel hit that ~37000 times a second during boot. Now the PC is
+  remembered and later TBs end before it.
+- TCI called helpers through libffi, which is JavaScript in Emscripten.
+  About 44 % of CPU time in the loop was spent there. Helpers are now
+  called through a pointer of the exact type
+  (`scripts/tci-direct-call.py`); only Int128 helpers still use libffi.
+
 Link-time `-O3` matters most: without it `wasm-opt` never optimizes the
 Asyncify-instrumented code. `-msimd128` can't be used, because Binaryen's
 memory64 lowering rejects SIMD lane/splat loads. The disc is symlinked as

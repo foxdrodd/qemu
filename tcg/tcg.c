@@ -1446,11 +1446,53 @@ static ffi_type *typecode_to_ffi(int argmask)
     g_assert_not_reached();
 }
 
+/* Signature id for direct calls from TCI, see TCI_SIG. */
+static uint32_t tci_call_sig(unsigned typemask, int nargs)
+{
+    unsigned r, m = 0;
+
+    switch (typemask & 7) {
+    case dh_typecode_void:
+        r = 0;
+        break;
+    case dh_typecode_i32:
+    case dh_typecode_s32:
+        r = 1;
+        break;
+    case dh_typecode_i64:
+    case dh_typecode_s64:
+        r = 2;
+        break;
+    case dh_typecode_ptr:
+        r = sizeof(void *) == 8 ? 2 : 1;
+        break;
+    default:
+        return TCI_SIG_NONE;
+    }
+    for (int j = 0; j < nargs; ++j) {
+        switch (extract32(typemask, (j + 1) * 3, 3)) {
+        case dh_typecode_i32:
+        case dh_typecode_s32:
+            break;
+        case dh_typecode_i64:
+        case dh_typecode_s64:
+            m |= 1u << j;
+            break;
+        case dh_typecode_ptr:
+            m |= (sizeof(void *) == 8) << j;
+            break;
+        default:
+            return TCI_SIG_NONE;
+        }
+    }
+    return TCI_SIG(r, nargs, m);
+}
+
 static ffi_cif *init_ffi_layout(TCGHelperInfo *info)
 {
     unsigned typemask = info->typemask;
     struct {
-        ffi_cif cif;
+        TCIHelperCif hc;
         ffi_type *args[];
     } *ca;
     ffi_status status;
@@ -1462,22 +1504,23 @@ static ffi_cif *init_ffi_layout(TCGHelperInfo *info)
     assert(nargs <= MAX_CALL_IARGS);
 
     ca = g_malloc0(sizeof(*ca) + nargs * sizeof(ffi_type *));
-    ca->cif.rtype = typecode_to_ffi(typemask & 7);
-    ca->cif.nargs = nargs;
+    ca->hc.sig = tci_call_sig(typemask, nargs);
+    ca->hc.cif.rtype = typecode_to_ffi(typemask & 7);
+    ca->hc.cif.nargs = nargs;
 
     if (nargs != 0) {
-        ca->cif.arg_types = ca->args;
+        ca->hc.cif.arg_types = ca->args;
         for (int j = 0; j < nargs; ++j) {
             int typecode = extract32(typemask, (j + 1) * 3, 3);
             ca->args[j] = typecode_to_ffi(typecode);
         }
     }
 
-    status = ffi_prep_cif(&ca->cif, FFI_DEFAULT_ABI, nargs,
-                          ca->cif.rtype, ca->cif.arg_types);
+    status = ffi_prep_cif(&ca->hc.cif, FFI_DEFAULT_ABI, nargs,
+                          ca->hc.cif.rtype, ca->hc.cif.arg_types);
     assert(status == FFI_OK);
 
-    return &ca->cif;
+    return &ca->hc.cif;
 }
 
 #define HELPER_INFO_INIT(I)      (&(I)->cif)
