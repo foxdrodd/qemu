@@ -67,6 +67,13 @@ DeviceState *dc_holly_init(hwaddr base, qemu_irq irl_out);
 /* hw/dma/dreamcast_ch2dma.c - Holly CH2 ("PVR") DMA. */
 void dc_ch2dma_init(hwaddr base, struct SH7750State *sh, qemu_irq irq);
 
+/*
+ * hw/block/dreamcast_io.c - run fn(opaque) synchronously.  On Emscripten,
+ * when called on a vCPU thread, it runs in the main loop thread instead, so
+ * the block layer's coroutines never switch underneath cpu_exec().
+ */
+void dc_run_io_sync(void (*fn)(void *), void *opaque);
+
 /* hw/block/dreamcast_gdrom.c - GD-ROM drive. dc_gdrom_read_logical() and
  * dc_gdrom_data_lba() serve the board's boot-from-disc firmware. */
 DeviceState *dc_gdrom_init(hwaddr base, qemu_irq irq_cmd, qemu_irq irq_dma,

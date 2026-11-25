@@ -34,6 +34,7 @@
 #include "tcg/tcg.h"
 #include "qemu/atomic.h"
 #include "qemu/rcu.h"
+#include "qemu/coroutine.h"
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "exec/icount.h"
@@ -1042,7 +1043,13 @@ int cpu_exec(CPUState *cpu)
      */
     init_delay_params(&sc, cpu);
 
+#ifdef EMSCRIPTEN
+    qemu_coroutine_switch_forbidden++;
+#endif
     ret = cpu_exec_setjmp(cpu, &sc);
+#ifdef EMSCRIPTEN
+    qemu_coroutine_switch_forbidden--;
+#endif
 
     cpu_exec_exit(cpu);
     return ret;

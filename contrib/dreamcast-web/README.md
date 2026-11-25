@@ -37,7 +37,7 @@ Measured on the busybox CDI with a 20k-iteration shell loop:
 | + `-fno-stack-protector`, `-sMALLOC=mimalloc` (**default**) | 19.3 s | 41.1 s | 14.7 MB |
 | + LTO | 21.2 s | 44.5 s | 16.9 MB |
 
-Two TCG changes on top (host-clock times, same benchmark; boot = page load
+TCG and Asyncify changes on top (host-clock times, same benchmark; boot = page load
 to the serial getty):
 
 | | boot | shell loop |
@@ -47,6 +47,7 @@ to the serial getty):
 | + direct TCI helper calls (`tcg/tci.c`) | 7.3 s | 17.6 s |
 | + no QEMU TLB flush on SH4 ITLB refill (`target/sh4/helper.c`) | 7.3 s | ~11.7 s |
 | + TLB-hit fast path for TCI loads/stores (`tcg/tci.c`) | 6.0 s | ~8.5 s |
+| + TCG execution path excluded from Asyncify (`asyncify-remove.json`) | 4.3 s | ~6.5 s |
 
 - QEMU requires MMIO to be the last insn of a TB. Otherwise
   `cpu_io_recompile()` exits via longjmp and re-executes the insn,
@@ -65,6 +66,22 @@ to the serial getty):
   About 44 % of CPU time in the loop was spent there. Helpers are now
   called through a pointer of the exact type
   (`scripts/tci-direct-call.py`); only Int128 helpers still use libffi.
+- Asyncify instruments every function that may be on the stack when a
+  fiber (coroutine) switches, which includes anything making indirect calls:
+  the interpreter loop too. The GD-ROM and VMU did their block I/O from
+  MMIO / Maple DMA handlers, i.e. under `cpu_exec()`, and `blk_pread()`
+  enters a coroutine there. On Emscripten `dc_run_io_sync()`
+  (`hw/block/dreamcast_io.c`) now runs that I/O in the main loop thread
+  while the vCPU waits without the BQL, so the hot TCG functions can be
+  left out of the transform (`-sASYNCIFY_REMOVE`). A coroutine switch
+  inside `cpu_exec()` would now corrupt the stack, so
+  `util/coroutine-wasm.c` aborts with a message instead.
+
+The upstream Wasm TCG backend series (v4, Jan 2026; a JIT for hot TBs) was
+tried on this tree: boot 7.1 s and shell loop 10.5 s against 5.8 s and
+10.1 s for TCI at that point, and 300 process starts were 1.5x slower. Its
+generated code keeps the TCG registers in Wasm globals, and its cold-path
+interpreter lacks the TCI changes above.
 
 Link-time `-O3` matters most: without it `wasm-opt` never optimizes the
 Asyncify-instrumented code. `-msimd128` can't be used, because Binaryen's

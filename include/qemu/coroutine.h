@@ -20,6 +20,11 @@
 #include "qemu/queue.h"
 #include "qemu/timer.h"
 
+#ifdef EMSCRIPTEN
+/* See util/coroutine-wasm.c; raised by cpu_exec() around TB execution. */
+extern __thread int qemu_coroutine_switch_forbidden;
+#endif
+
 /**
  * Coroutines are a mechanism for stack switching and can be used for
  * cooperative userspace threading.  These functions provide a simple but

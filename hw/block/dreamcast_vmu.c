@@ -312,6 +312,45 @@ static int vmu_bsync(DCVmu *v, uint8_t host, uint8_t dev, uint8_t *buf)
  * data bytes; data[0..3] is the function code (big-endian), which selects the
  * memory-card vs LCD function for block writes.
  */
+/* Flash commands touch the BlockBackend; see dc_run_io_sync(). */
+typedef struct VmuStorageReq {
+    DCVmu *v;
+    uint8_t cmd, host, dev;
+    const uint8_t *data;
+    int datalen;
+    uint8_t *resp;
+    int ret;
+} VmuStorageReq;
+
+static void vmu_storage_io(void *opaque)
+{
+    VmuStorageReq *r = opaque;
+
+    switch (r->cmd) {
+    case CMD_BREAD:
+        r->ret = vmu_bread(r->v, r->data, r->datalen, r->host, r->dev, r->resp);
+        break;
+    case CMD_BWRITE:
+        r->ret = vmu_bwrite(r->v, r->data, r->datalen, r->host, r->dev, r->resp);
+        break;
+    default:
+        r->ret = vmu_bsync(r->v, r->host, r->dev, r->resp);
+        break;
+    }
+}
+
+static int vmu_storage(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
+                       const uint8_t *data, int datalen, uint8_t *resp)
+{
+    VmuStorageReq r = {
+        .v = v, .cmd = cmd, .host = host, .dev = dev,
+        .data = data, .datalen = datalen, .resp = resp,
+    };
+
+    dc_run_io_sync(vmu_storage_io, &r);
+    return r.ret;
+}
+
 int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
                  const uint8_t *data, int datalen, uint8_t *resp)
 {
@@ -321,16 +360,16 @@ int dc_vmu_maple(DCVmu *v, uint8_t cmd, uint8_t host, uint8_t dev,
     case CMD_GETMINFO:
         return vmu_getminfo(host, dev, resp);
     case CMD_BREAD:
-        return vmu_bread(v, data, datalen, host, dev, resp);
+        return vmu_storage(v, cmd, host, dev, data, datalen, resp);
     case CMD_BWRITE:
         if (datalen >= 4 && v->lcd_enabled &&
             data[0] == 0 && data[1] == 0 && data[2] == 0 &&
             data[3] == FUNC_LCD) {
             return vmu_lcd_bwrite(v, data, datalen, host, dev, resp);
         }
-        return vmu_bwrite(v, data, datalen, host, dev, resp);
+        return vmu_storage(v, cmd, host, dev, data, datalen, resp);
     case CMD_BSYNC:
-        return vmu_bsync(v, host, dev, resp);
+        return vmu_storage(v, cmd, host, dev, data, datalen, resp);
     default:
         resp[0] = RESP_NONE;
         return 4;

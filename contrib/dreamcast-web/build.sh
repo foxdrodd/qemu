@@ -21,8 +21,12 @@ JOBS=${JOBS:-12}
 # big one (~1.9x: it lets wasm-opt clean up after the Asyncify transform);
 # compile -O3 -g0, no stack protector and mimalloc add ~10%.  -msimd128 breaks
 # wasm-opt's memory64 lowering; LTO was slightly slower and bigger.
+# asyncify-remove.json keeps the TCG execution path (the interpreter loop and
+# its ld/st and TB lookup helpers) out of the Asyncify transform, another
+# ~1.3x; that is safe because no coroutine switches on a vCPU thread (see
+# hw/block/dreamcast_io.c; util/coroutine-wasm.c aborts if one does).
 WASM_CFLAGS=${WASM_CFLAGS--O3 -g0 -fno-stack-protector}
-WASM_LDFLAGS=${WASM_LDFLAGS--O3 -sMALLOC=mimalloc}
+WASM_LDFLAGS=${WASM_LDFLAGS--O3 -sMALLOC=mimalloc -sASYNCIFY_REMOVE=@$WEB_SRC/asyncify-remove.json}
 WASM_LTO=${WASM_LTO:-false}
 DISC=${1:-}
 

@@ -1,0 +1,1 @@
+["cpu_exec_loop", "cpu_tb_exec", "tcg_qemu_tb_exec", "tci_qemu_ld", "tci_qemu_st", "helper_lookup_tb_ptr"]

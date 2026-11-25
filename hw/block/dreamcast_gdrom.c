@@ -218,8 +218,10 @@ static void gdrom_packet_dispatch(DCGdromState *s)
 }
 
 /* Perform a latched CD read into guest memory, then post the DMA IRQ. */
-static void gdrom_do_dma(DCGdromState *s)
+/* The disc reads and RAM writes of a DMA transfer; see dc_run_io_sync(). */
+static void gdrom_do_dma_io(void *opaque)
 {
+    DCGdromState *s = opaque;
     uint32_t data_fad = s->data_lba + GDROM_SESSION_FAD;
     uint8_t sec[GDROM_SECTOR];
     dma_addr_t addr = s->dma_addr;
@@ -238,6 +240,11 @@ static void gdrom_do_dma(DCGdromState *s)
                          MEMTXATTRS_UNSPECIFIED);
         addr += GDROM_SECTOR;
     }
+}
+
+static void gdrom_do_dma(DCGdromState *s)
+{
+    dc_run_io_sync(gdrom_do_dma_io, s);
     s->dma_pending = 0;
     s->status |= GDS_BSY;
     s->pending_cmd = 0;
@@ -245,9 +252,9 @@ static void gdrom_do_dma(DCGdromState *s)
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GDROM_CMD_DELAY_NS);
 }
 
-/* Load the next sector of a PIO CD read into the PIO buffer. */
-static void gdrom_pio_load_sector(DCGdromState *s)
+static void gdrom_pio_load_io(void *opaque)
 {
+    DCGdromState *s = opaque;
     uint32_t data_fad = s->data_lba + GDROM_SESSION_FAD;
     uint32_t rel = s->read_fad - data_fad;
 
@@ -256,6 +263,12 @@ static void gdrom_pio_load_sector(DCGdromState *s)
         int64_t off = s->data_off + (int64_t)rel * s->raw_size + s->sec_hdr;
         blk_pread(s->blk, off, GDROM_SECTOR, s->pio, 0);
     }
+}
+
+/* Load the next sector of a PIO CD read into the PIO buffer. */
+static void gdrom_pio_load_sector(DCGdromState *s)
+{
+    dc_run_io_sync(gdrom_pio_load_io, s);
     s->read_fad++;
     s->read_count--;
     s->pio_len = GDROM_SECTOR;
@@ -692,10 +705,29 @@ DeviceState *dc_gdrom_init(hwaddr base, qemu_irq irq_cmd, qemu_irq irq_dma,
 }
 
 /* Board boot-firmware access: read logical sectors from the mounted disc. */
+typedef struct GdromLogicalRead {
+    DCGdromState *s;
+    uint32_t lba, nsec;
+    uint8_t *buf;
+    bool ok;
+} GdromLogicalRead;
+
+static void gdrom_read_logical_io(void *opaque)
+{
+    GdromLogicalRead *r = opaque;
+
+    r->ok = gdrom_read_logical(r->s, r->lba, r->nsec, r->buf);
+}
+
 bool dc_gdrom_read_logical(DeviceState *dev, uint32_t lba, uint32_t nsec,
                            uint8_t *buf)
 {
-    return gdrom_read_logical(DC_GDROM(dev), lba, nsec, buf);
+    GdromLogicalRead r = {
+        .s = DC_GDROM(dev), .lba = lba, .nsec = nsec, .buf = buf,
+    };
+
+    dc_run_io_sync(gdrom_read_logical_io, &r);
+    return r.ok;
 }
 
 /* Board boot-firmware access: the probed data-track start LBA. */

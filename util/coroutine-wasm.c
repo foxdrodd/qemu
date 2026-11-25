@@ -25,6 +25,14 @@
 
 #include <emscripten/fiber.h>
 
+/*
+ * Non-zero while this thread runs code that the build excludes from Asyncify
+ * (cpu_exec_setjmp() and the TCG execution path below it).  A fiber swap
+ * there would unwind through uninstrumented frames and corrupt the stack, so
+ * catch it here instead.
+ */
+__thread int qemu_coroutine_switch_forbidden;
+
 typedef struct {
     Coroutine base;
     void *stack;
@@ -88,6 +96,11 @@ CoroutineAction qemu_coroutine_switch(Coroutine *from_, Coroutine *to_,
     CoroutineEmscripten *from = DO_UPCAST(CoroutineEmscripten, base, from_);
     CoroutineEmscripten *to = DO_UPCAST(CoroutineEmscripten, base, to_);
 
+    if (qemu_coroutine_switch_forbidden) {
+        fprintf(stderr, "qemu: coroutine switch on a vCPU thread inside "
+                "cpu_exec(); this code is not instrumented by Asyncify\n");
+        abort();
+    }
     set_current(to_);
     to->action = action;
     emscripten_fiber_swap(&from->fiber, &to->fiber);
