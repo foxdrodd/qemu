@@ -45,12 +45,17 @@ to the serial getty):
 | flags above | 19.0 s | 34.8 s |
 | + I/O insn hints (`accel/tcg/translator.c`) | ~15 s | ~29 s |
 | + direct TCI helper calls (`tcg/tci.c`) | 7.3 s | 17.6 s |
+| + no QEMU TLB flush on SH4 ITLB refill (`target/sh4/helper.c`) | 7.3 s | ~11.7 s |
 
 - QEMU requires MMIO to be the last insn of a TB. Otherwise
   `cpu_io_recompile()` exits via longjmp and re-executes the insn,
   and Emscripten implements longjmp as a JS exception. Polling loops in the
   guest kernel hit that ~37000 times a second during boot. Now the PC is
   remembered and later TBs end before it.
+- The SH4 has a 4-entry ITLB refilled from the UTLB. QEMU flushed the
+  evicted page from its own TLB and jump cache on every refill, so code
+  spread over more than 4 pages thrashed (~20 % of a shell loop). The
+  flush is now skipped while the UTLB still holds that mapping.
 - TCI called helpers through libffi, which is JavaScript in Emscripten.
   About 44 % of CPU time in the loop was spent there. Helpers are now
   called through a pointer of the exact type

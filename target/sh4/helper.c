@@ -299,6 +299,21 @@ static void increment_urc(CPUSH4State * env)
     env->mmucr = (env->mmucr & 0xffff03ff) | (urc << 10);
 }
 
+/* Does a valid UTLB entry still provide this ITLB entry's mapping? */
+static bool itlb_entry_in_utlb(CPUSH4State *env, const tlb_t *ientry)
+{
+    for (int i = 0; i < UTLB_SIZE; i++) {
+        const tlb_t *u = &env->utlb[i];
+
+        if (u->v && u->vpn == ientry->vpn && u->ppn == ientry->ppn &&
+            u->size == ientry->size && u->asid == ientry->asid &&
+            u->sh == ientry->sh && u->pr == ientry->pr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Copy and utlb entry into itlb
    Return entry
 */
@@ -309,7 +324,17 @@ static int copy_utlb_entry_itlb(CPUSH4State *env, int utlb)
     tlb_t * ientry;
     itlb = itlb_replacement(env);
     ientry = &env->itlb[itlb];
-    if (ientry->v) {
+    /*
+     * The 4-entry ITLB is only a cache of the UTLB: hardware refills it
+     * from there without an exception, so evicting an entry whose mapping
+     * the UTLB still holds changes nothing the guest can observe.  Keep
+     * QEMU's TLB entry for that page then.  Flushing it here made every
+     * ITLB refill evict another hot code page (and its jump cache), and
+     * code spread over more than 4 pages thrashed: ~20 % of CPU time in
+     * a shell loop.  Mappings that really change (LDTLB, memory-mapped
+     * TLB writes, ASID change, MMUCR.TI) are flushed where that happens.
+     */
+    if (ientry->v && !itlb_entry_in_utlb(env, ientry)) {
         tlb_flush_page(env_cpu(env), ientry->vpn << 10);
     }
     *ientry = env->utlb[utlb];
