@@ -97,6 +97,19 @@ LAN `0x00600400`. Boot params page at `0x8c001000` (`CONFIG_CMDLINE_OVERWRITE`).
   broadcast timing and X fails with `FBIOPUT_VSCREENINFO: Invalid argument`.
 - **initrd**: patch the boot-params page via `rom_ptr()` on the ELF blob; a direct
   `address_space_stl` gets clobbered by the ROM-blob reset copy.
+- **`rte` must return to `cpu_exec_loop()`** (target/sh4/translate.c, end of the
+  rte delay slot). The INTC kicks the CPU only when an interrupt *becomes*
+  pending. If that attempt hits IMASK=15 (handler / irq-off region), the kick is
+  spent; `rte` then unmasks, and chaining on via `lookup_and_goto_ptr` never
+  re-checks. A guest spinning with interrupts on (e.g. gdrom
+  `gdrom_wait_busy_sleeps()`) then loses its timer forever: jiffies freeze and
+  boot hangs after "Uniform CD-ROM driver". Seen in ~5-20 % of browser boots
+  (slow vCPU vs main-loop timers), rarely natively. Symptom in a debugger:
+  `interrupt_request` has HARD, TMU0 UNF+UNIE set, SR.IMASK 0, no delivery.
+- **GD-ROM BSY must be observable.** Linux waits up to 7 s for BSY to *appear*
+  after EXECDIAG/IDENTIFY/SET FEATURES; with a slow vCPU the 0.1 ms busy timer
+  can expire first. `bsy_hold` keeps a plain ATA command busy until the guest
+  has read BSY once (max 100 ms).
 
 ## Headless testing (see `dcemulator/scratchpad/*.py`)
 

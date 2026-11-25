@@ -73,6 +73,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(DCGdromState, DC_GDROM)
 #define SPI_PREPDISK  0x70
 
 #define GDROM_CMD_DELAY_NS 100000       /* ~0.1 ms command latency */
+/*
+ * Linux's gdrom_wait_busy_sleeps() first waits for BSY to *appear* after
+ * EXECDIAG / IDENTIFY / SET FEATURES and only gives up after 7 s.  When the
+ * vCPU is slow relative to the virtual clock (TCI in a browser), our 0.1 ms
+ * busy period can end before the guest's first status read, costing a 7 s
+ * stall at boot.  So keep a plain ATA command busy until the guest has seen
+ * BSY once, for at most this many extra delay periods (100 ms).
+ */
+#define GDROM_BSY_HOLD_MAX 1000
 #define GDROM_SECTOR      2048
 #define GDROM_SESSION_FAD 150           /* LBA -> FAD offset (2s pregap) */
 #define GDROM_DATA_LBA    11702         /* CD-R data-track start (genisoimage -C) */
@@ -107,6 +116,7 @@ struct DCGdromState {
     uint8_t dsel;
     uint8_t pending_cmd;
     int post_cmd_irq;
+    int32_t bsy_hold;               /* see GDROM_BSY_HOLD_MAX */
 
     int phase;
     uint8_t packet[12];
@@ -309,6 +319,13 @@ static void gdrom_cmd_complete(void *opaque)
 {
     DCGdromState *s = opaque;
 
+    if (s->pending_cmd != GDC_PACKET && s->bsy_hold > 0) {
+        s->bsy_hold--;
+        timer_mod(s->cmd_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + GDROM_CMD_DELAY_NS);
+        return;
+    }
+    s->bsy_hold = 0;
     s->status &= ~GDS_BSY;
     s->status |= GDS_DRDY | GDS_DSC;
 
@@ -354,6 +371,9 @@ static uint64_t gdrom_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case GDR_ALTSTATUS:
     case GDR_STATUSCMD:
+        if (s->status & GDS_BSY) {
+            s->bsy_hold = 0;            /* the guest has seen BSY */
+        }
         return s->status;
     case GDR_ERROR:
         return s->error;
@@ -434,6 +454,7 @@ static void gdrom_write(void *opaque, hwaddr addr, uint64_t val,
         } else {
             s->pending_cmd = val & 0xff;
             s->post_cmd_irq = 0;
+            s->bsy_hold = GDROM_BSY_HOLD_MAX;
             s->status |= GDS_BSY;
             s->status &= ~GDS_ERR;
             timer_mod(s->cmd_timer,
@@ -443,6 +464,7 @@ static void gdrom_write(void *opaque, hwaddr addr, uint64_t val,
     case GDR_RESET:
         s->status = GDS_DRDY | GDS_DSC;
         s->error = 0x01;
+        s->bsy_hold = 0;
         s->phase = PHASE_IDLE;
         s->pio_len = s->pio_idx = 0;
         break;
@@ -610,6 +632,7 @@ static void gdrom_reset_hold(Object *obj, ResetType type)
     s->dsel = 0;
     s->pending_cmd = 0;
     s->post_cmd_irq = 0;
+    s->bsy_hold = 0;
     s->phase = PHASE_IDLE;
     s->packet_idx = 0;
     memset(s->packet, 0, sizeof(s->packet));
@@ -640,6 +663,7 @@ static const VMStateDescription vmstate_dreamcast_gdrom = {
         VMSTATE_UINT8(dsel, DCGdromState),
         VMSTATE_UINT8(pending_cmd, DCGdromState),
         VMSTATE_INT32(post_cmd_irq, DCGdromState),
+        VMSTATE_INT32(bsy_hold, DCGdromState),
         VMSTATE_INT32(phase, DCGdromState),
         VMSTATE_UINT8_ARRAY(packet, DCGdromState, 12),
         VMSTATE_INT32(packet_idx, DCGdromState),
