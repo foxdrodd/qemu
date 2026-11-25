@@ -1805,7 +1805,22 @@ static void decode_opc(DisasContext * ctx)
         ctx->envflags &= ~TB_FLAG_GUSA_MASK;
 
         tcg_gen_movi_i32(cpu_flags, ctx->envflags);
-        if (old_flags & TB_FLAG_DELAY_SLOT_COND) {
+        if (old_flags & TB_FLAG_DELAY_SLOT_RTE) {
+            /*
+             * rte restored SR and may have unmasked an interrupt that is
+             * already pending.  Pending interrupts are only re-checked in
+             * cpu_exec_loop(): the CPU is kicked when an interrupt becomes
+             * pending, not while it stays pending, and an attempt made
+             * while SR.IMASK still masked it (or in this delay slot) has
+             * already consumed that kick.  So return to the loop instead of
+             * chaining via lookup_and_goto_ptr, or a guest spinning with
+             * interrupts enabled never sees e.g. its timer tick again.
+             */
+            tcg_gen_mov_i32(cpu_pc, cpu_delayed_pc);
+            tcg_gen_discard_i32(cpu_delayed_pc);
+            tcg_gen_exit_tb(NULL, 0);
+            ctx->base.is_jmp = DISAS_NORETURN;
+        } else if (old_flags & TB_FLAG_DELAY_SLOT_COND) {
             gen_delayed_conditional_jump(ctx);
         } else {
             gen_jump(ctx);
