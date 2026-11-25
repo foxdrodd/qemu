@@ -24,6 +24,13 @@
 #include "disas/dis-asm.h"
 #include "tcg-has.h"
 #include <ffi.h>
+#ifndef CONFIG_USER_ONLY
+#include "hw/core/cpu.h"
+#include "exec/target_page.h"
+#include "exec/tlb-common.h"
+#include "exec/memop.h"
+#include "qemu/bswap.h"
+#endif
 
 #ifdef TCI_DIRECT_CALL
 /*
@@ -278,11 +285,79 @@ static bool tci_compare64(uint64_t u0, uint64_t u1, TCGCond condition)
     return result;
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * Fast path for guest memory accesses, as the native backends emit inline:
+ * an aligned access within one page whose TLB entry matches without any
+ * flag bits (so: RAM, no watchpoint, not dirty-tracked, no byte swap
+ * forced) goes straight to host memory.  Everything else (TLB miss, MMIO,
+ * unaligned, page-crossing) takes the helper path.  Returns the host
+ * address, or NULL.
+ */
+static inline void *tci_tlb_host(CPUArchState *env, uint64_t addr,
+                                 MemOpIdx oi, bool is_ld)
+{
+    MemOp mop = get_memop(oi);
+    unsigned size = memop_size(mop);
+    uint64_t a_mask = (1u << memop_alignment_bits(mop)) - 1;
+    /* The inverse of cpu_env(): CPUArchState follows CPUState. */
+    CPUTLBDescFast *fast = cpu_tlb_fast((CPUState *)env - 1, get_mmuidx(oi));
+    uintptr_t ofs = (addr >> (TARGET_PAGE_BITS - CPU_TLB_ENTRY_BITS)) &
+                    fast->mask;
+    CPUTLBEntry *e = (CPUTLBEntry *)((char *)fast->table + ofs);
+    uint64_t page = addr & (uint64_t)(int64_t)TARGET_PAGE_MASK;
+    uintptr_t cmp = is_ld ? e->addr_read : qatomic_read(&e->addr_write);
+
+    if ((addr & a_mask) || cmp != page ||
+        ((addr + size - 1) & (uint64_t)(int64_t)TARGET_PAGE_MASK) != page) {
+        return NULL;
+    }
+    return (void *)(uintptr_t)(addr + e->addend);
+}
+#endif
+
 static uint64_t tci_qemu_ld(CPUArchState *env, uint64_t taddr,
                             MemOpIdx oi, const void *tb_ptr)
 {
     MemOp mop = get_memop(oi);
     uintptr_t ra = (uintptr_t)tb_ptr;
+
+#ifndef CONFIG_USER_ONLY
+    void *h = tci_tlb_host(env, taddr, oi, true);
+
+    if (h) {
+        uint64_t v;
+
+        switch (mop & MO_SIZE) {
+        case MO_8:
+            v = *(uint8_t *)h;
+            break;
+        case MO_16:
+            v = (uint16_t)lduw_he_p(h);
+            v = mop & MO_BSWAP ? bswap16(v) : v;
+            break;
+        case MO_32:
+            v = (uint32_t)ldl_he_p(h);
+            v = mop & MO_BSWAP ? bswap32(v) : v;
+            break;
+        default:
+            v = ldq_he_p(h);
+            v = mop & MO_BSWAP ? bswap64(v) : v;
+            break;
+        }
+        if (mop & MO_SIGN) {
+            switch (mop & MO_SIZE) {
+            case MO_8:
+                return (int8_t)v;
+            case MO_16:
+                return (int16_t)v;
+            case MO_32:
+                return (int32_t)v;
+            }
+        }
+        return v;
+    }
+#endif
 
     switch (mop & MO_SSIZE) {
     case MO_UB:
@@ -309,6 +384,28 @@ static void tci_qemu_st(CPUArchState *env, uint64_t taddr, uint64_t val,
 {
     MemOp mop = get_memop(oi);
     uintptr_t ra = (uintptr_t)tb_ptr;
+
+#ifndef CONFIG_USER_ONLY
+    void *h = tci_tlb_host(env, taddr, oi, false);
+
+    if (h) {
+        switch (mop & MO_SIZE) {
+        case MO_8:
+            *(uint8_t *)h = val;
+            break;
+        case MO_16:
+            stw_he_p(h, mop & MO_BSWAP ? bswap16(val) : val);
+            break;
+        case MO_32:
+            stl_he_p(h, mop & MO_BSWAP ? bswap32(val) : val);
+            break;
+        default:
+            stq_he_p(h, mop & MO_BSWAP ? bswap64(val) : val);
+            break;
+        }
+        return;
+    }
+#endif
 
     switch (mop & MO_SIZE) {
     case MO_UB:

@@ -46,6 +46,7 @@ to the serial getty):
 | + I/O insn hints (`accel/tcg/translator.c`) | ~15 s | ~29 s |
 | + direct TCI helper calls (`tcg/tci.c`) | 7.3 s | 17.6 s |
 | + no QEMU TLB flush on SH4 ITLB refill (`target/sh4/helper.c`) | 7.3 s | ~11.7 s |
+| + TLB-hit fast path for TCI loads/stores (`tcg/tci.c`) | 6.0 s | ~8.5 s |
 
 - QEMU requires MMIO to be the last insn of a TB. Otherwise
   `cpu_io_recompile()` exits via longjmp and re-executes the insn,
@@ -56,6 +57,10 @@ to the serial getty):
   evicted page from its own TLB and jump cache on every refill, so code
   spread over more than 4 pages thrashed (~20 % of a shell loop). The
   flush is now skipped while the UTLB still holds that mapping.
+- TCI sent every guest load/store through the softmmu helpers. It now
+  checks QEMU's TLB itself first, like the inline code of the native
+  backends: an aligned in-page access to plain RAM goes straight to host
+  memory.
 - TCI called helpers through libffi, which is JavaScript in Emscripten.
   About 44 % of CPU time in the loop was spent there. Helpers are now
   called through a pointer of the exact type
